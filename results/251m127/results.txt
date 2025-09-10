@@ -1,0 +1,19 @@
+=== NO QDISC ===
+Error: Cannot delete qdisc with handle of zero.
+created graph: /tmp/bbperf-graph-data-udp-hp6evioh.png
+qdisc noqueue 0: root refcnt 2 
+ Sent 0 bytes 0 pkt (dropped 0, overlimits 0 requeues 0) 
+ backlog 0b 0p requeues 0
+=== QDISC FQ_CODEL  ===
+created graph: /tmp/bbperf-graph-data-udp-fnyk7jnh.png
+qdisc fq_codel 80c5: root refcnt 193 limit 10240p flows 1024 quantum 1514 target 5ms interval 100ms memory_limit 32Mb ecn drop_batch 64 
+ Sent 11221317128 bytes 9874795 pkt (dropped 0, overlimits 0 requeues 0) 
+ backlog 0b 0p requeues 0
+  maxpacket 1137 drop_overlimit 0 new_flow_count 137 ecn_mark 0
+  new_flows_len 0 old_flows_len 0
+=== QDISC SFQ ===
+created graph: /tmp/bbperf-graph-data-udp-1maqlb12.png
+qdisc sfq 80c6: root refcnt 193 limit 127p quantum 1514b depth 127 divisor 1024 
+ Sent 11087496899 bytes 9756984 pkt (dropped 0, overlimits 0 requeues 0) 
+ backlog 0b 0p requeues 0
+
