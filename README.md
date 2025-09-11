@@ -3,7 +3,7 @@ perf-veth-bp
 
 Install dependencies:
 ```
-apt install python3-virtualenv gnuplot
+apt install python3-virtualenv gnuplot ttyplot
 ```
 
 Setup:
