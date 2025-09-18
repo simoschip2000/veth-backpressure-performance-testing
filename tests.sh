@@ -6,7 +6,10 @@ TIME=60
 run_test() {
   output=$1
   ip netns exec client bbperf -t $TIME -u -c 192.168.20.2 -B 192.168.20.1 -g -J $output.json | grep "created graph"
+  # Qdisc output: Look for requeues
   ip netns exec client tc -s qdisc ls dev to-server
+  # Interface stats: Look for TX dropped
+  ip -netns client -s link ls dev to-server
 }
 
 echo "=== NO QDISC ==="
