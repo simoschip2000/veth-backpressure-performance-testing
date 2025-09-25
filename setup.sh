@@ -10,8 +10,8 @@ ip netns add client
 ip netns add router
 
 # setup routing between netns namespaces
-ip -netns client link add dev to-router type veth peer name client-link netns router
-ip -netns server link add dev in-router type veth peer name server-link netns router
+ip -netns client link add dev to-router type veth peer name client-link netns router numtxqueues 8 numrxqueues 8
+ip -netns server link add dev in-router type veth peer name server-link netns router numtxqueues 8 numrxqueues 8
 
 # bring up devices and assign IPs
 #
