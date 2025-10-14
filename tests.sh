@@ -1,7 +1,7 @@
 #!/bin/bash
 source ./venv/bin/activate
 
-TIME=15
+TIME=60
 
 DEV=server-link
 NS=router
