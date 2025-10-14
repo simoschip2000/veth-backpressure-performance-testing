@@ -1,0 +1,60 @@
+=== no_qdisc ===
+qdisc noqueue 0: root refcnt 2 
+ Sent 0 bytes 0 pkt (dropped 0, overlimits 0 requeues 0) 
+ backlog 0b 0p requeues 0
+3: server-link@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP mode DEFAULT group default qlen 1000
+    link/ether 16:70:8b:de:f1:7d brd ff:ff:ff:ff:ff:ff link-netns server
+    RX:  bytes packets errors dropped  missed   mcast           
+        111978     678      0       0       0       0 
+    TX:  bytes packets errors dropped carrier collsns           
+     604677231  540692      0   67939       0       0 
+=== fq_codel ===
+qdisc fq_codel 8001: root refcnt 9 limit 10240p flows 1024 quantum 1514 target 5ms interval 100ms memory_limit 32Mb ecn drop_batch 64 
+ Sent 614360416 bytes 542579 pkt (dropped 66025, overlimits 0 requeues 42276) 
+ backlog 0b 0p requeues 42276
+  maxpacket 1134 drop_overlimit 5120 new_flow_count 623 ecn_mark 0
+  new_flows_len 0 old_flows_len 0
+3: server-link@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000
+    link/ether 16:70:8b:de:f1:7d brd ff:ff:ff:ff:ff:ff link-netns server
+    RX:  bytes packets errors dropped  missed   mcast           
+        223984    1350      0       0       0       0 
+    TX:  bytes packets errors dropped carrier collsns           
+    1211441541 1083271      0   67939       0       0 
+=== sfq ===
+qdisc sfq 8002: root refcnt 9 limit 127p quantum 1514b depth 127 divisor 1024 
+ Sent 607300707 bytes 536378 pkt (dropped 72190, overlimits 0 requeues 41631) 
+ backlog 0b 0p requeues 41631
+3: server-link@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc sfq state UP mode DEFAULT group default qlen 1000
+    link/ether 16:70:8b:de:f1:7d brd ff:ff:ff:ff:ff:ff link-netns server
+    RX:  bytes packets errors dropped  missed   mcast           
+        333622    2008      0       0       0       0 
+    TX:  bytes packets errors dropped carrier collsns           
+    1811232956 1619649      0   67939       0       0 
+=== mq_fq_codel_qdisc ===
+qdisc mq 1: root 
+ Sent 614049898 bytes 542335 pkt (dropped 66278, overlimits 0 requeues 8458) 
+ backlog 0b 0p requeues 8458
+qdisc fq_codel 8003: parent 1:1 limit 10240p flows 1024 quantum 1514 target 5ms interval 100ms memory_limit 32Mb ecn drop_batch 64 
+ Sent 614049898 bytes 542335 pkt (dropped 66278, overlimits 0 requeues 8458) 
+ backlog 0b 0p requeues 8458
+  maxpacket 1134 drop_overlimit 4160 new_flow_count 621 ecn_mark 0
+  new_flows_len 0 old_flows_len 0
+3: server-link@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP mode DEFAULT group default qlen 1000
+    link/ether 16:70:8b:de:f1:7d brd ff:ff:ff:ff:ff:ff link-netns server
+    RX:  bytes packets errors dropped  missed   mcast           
+        445839    2681      0       0       0       0 
+    TX:  bytes packets errors dropped carrier collsns           
+    2417690164 2161984      0   67939       0       0 
+=== mq_sfq_qdisc ===
+qdisc mq 1: root 
+ Sent 610688196 bytes 539367 pkt (dropped 69259, overlimits 0 requeues 8386) 
+ backlog 0b 0p requeues 8386
+qdisc sfq 8004: parent 1:1 limit 127p quantum 1514b depth 127 divisor 1024 
+ Sent 610688196 bytes 539367 pkt (dropped 69259, overlimits 0 requeues 8386) 
+ backlog 0b 0p requeues 8386
+3: server-link@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP mode DEFAULT group default qlen 1000
+    link/ether 16:70:8b:de:f1:7d brd ff:ff:ff:ff:ff:ff link-netns server
+    RX:  bytes packets errors dropped  missed   mcast           
+        557379    3351      0       0       0       0 
+    TX:  bytes packets errors dropped carrier collsns           
+    3020827222 2701351      0   67939       0       0 
