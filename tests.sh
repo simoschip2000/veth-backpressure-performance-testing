@@ -1,5 +1,6 @@
 #!/bin/bash
 source ./venv/bin/activate
+set -euo pipefail
 
 TIME=60
 
