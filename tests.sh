@@ -32,6 +32,9 @@ run_test "no_qdisc"
 ip netns exec ${NS} tc qdisc replace dev ${DEV} root fq_codel
 run_test "fq_codel"
 
+ip netns exec ${NS} tc qdisc replace dev ${DEV} root codel
+run_test "codel"
+
 ip netns exec ${NS} tc qdisc replace dev ${DEV} root sfq
 run_test "sfq"
 
