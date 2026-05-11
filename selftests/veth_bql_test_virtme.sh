@@ -17,7 +17,8 @@
 
 set -eu
 
-# Parse --verbose (consumed here, not forwarded to the inner test).
+# Parse --verbose (consumed here for vng console, not forwarded).
+# --hist is forwarded to the inner test for bpftrace histogram output.
 VERBOSE=""
 INNER_ARGS=()
 for arg in "$@"; do

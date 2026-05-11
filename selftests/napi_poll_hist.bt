@@ -12,8 +12,9 @@ tracepoint:napi:napi_poll
 /str(args->dev_name, 8) == "veth_bql"/
 {
 	@work = lhist(args->work, 0, 65, 1);
+	@napi_work_stats = stats(args->work);
 	@total++;
-	@sum += args->work;
+	@sum += (uint64)args->work;
 	if (args->work == args->budget) {
 		@full++;
 	}
@@ -21,9 +22,11 @@ tracepoint:napi:napi_poll
 
 interval:s:5
 {
-	$avg = @total > 0 ? @sum / @total : 0;
+	$avg = @total > 0 ? @sum / (uint64)@total : 0;
 	printf("napi_poll: polls=%llu full_budget=%llu partial=%llu avg_work=%llu\n",
 	       @total, @full, @total - @full, $avg);
+	print(@napi_work_stats);
+	clear(@napi_work_stats);
 	clear(@total);
 	clear(@full);
 	clear(@sum);
@@ -33,7 +36,10 @@ END
 {
 	printf("\n--- napi_poll work histogram (lifetime) ---\n");
 	print(@work);
+	printf("\n--- napi_poll work stats (lifetime) ---\n");
+	print(@napi_work_stats);
 	clear(@work);
+	clear(@napi_work_stats);
 	clear(@total);
 	clear(@full);
 	clear(@sum);
