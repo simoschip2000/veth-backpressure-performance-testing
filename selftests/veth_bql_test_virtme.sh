@@ -60,7 +60,8 @@ if [ -n "$MISSING" ]; then
     exit 1
 fi
 
-TESTDIR="tools/testing/selftests/net"
+# Locate selftest scripts relative to this wrapper.
+TESTDIR="$(dirname "$(readlink -f "$0")")"
 TESTNAME="veth_bql_test.sh"
 LOGFILE="veth_bql_test.log"
 LOGPATH="$TESTDIR/$LOGFILE"
