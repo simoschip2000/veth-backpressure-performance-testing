@@ -1,0 +1,46 @@
+#!/usr/bin/env bpftrace
+// SPDX-License-Identifier: GPL-2.0
+// napi_poll work histogram for veth BQL testing.
+// Shows how many packets each NAPI poll processes (0..64).
+// Full-budget (64) polls mean more work is pending; partial (<64) means
+// the ring drained before the budget was exhausted.
+//
+// Usage: bpftrace napi_poll_hist.bt
+// Interval output is a single compact line for easy script parsing.
+
+tracepoint:napi:napi_poll
+/str(args->dev_name, 8) == "veth_bql"/
+{
+	@work = lhist(args->work, 0, 65, 1);
+	@napi_work_stats = stats(args->work);
+	@total++;
+	@sum += (uint64)args->work;
+	if (args->work == args->budget) {
+		@full++;
+	}
+}
+
+interval:s:5
+{
+	$avg = @total > 0 ? @sum / (uint64)@total : 0;
+	printf("napi_poll: polls=%llu full_budget=%llu partial=%llu avg_work=%llu\n",
+	       @total, @full, @total - @full, $avg);
+	print(@napi_work_stats);
+	clear(@napi_work_stats);
+	clear(@total);
+	clear(@full);
+	clear(@sum);
+}
+
+END
+{
+	printf("\n--- napi_poll work histogram (lifetime) ---\n");
+	print(@work);
+	printf("\n--- napi_poll work stats (lifetime) ---\n");
+	print(@napi_work_stats);
+	clear(@work);
+	clear(@napi_work_stats);
+	clear(@total);
+	clear(@full);
+	clear(@sum);
+}

@@ -1,0 +1,92 @@
+#!/usr/bin/env bpftrace
+// SPDX-License-Identifier: GPL-2.0
+// BQL inflight/limit histogram for veth BQL testing.
+// Since DQL functions (dql_queued, dql_avail, netdev_tx_sent_queue) are
+// all inlined, we probe veth_xmit (non-inlined ndo_start_xmit callback)
+// and read struct dql fields directly from dev->_tx[0].dql.
+//
+// With VETH_BQL_UNIT=1, DQL values directly represent packet counts:
+//   inflight = num_queued - num_completed  (packets in ptr_ring)
+//   limit    = auto-tuned DQL limit        (target max packets)
+//
+// Queue state bits:
+//   bit 0 = DRV_XOFF   (driver backpressure, ptr_ring full)
+//   bit 1 = STACK_XOFF  (BQL over-limit)
+//
+// NOTE: veth is a module -- it must be loaded before bpftrace attaches.
+// The test script creates the veth pair first, then starts bpftrace.
+// For manual use:  modprobe veth && bpftrace veth_bql_inflight.bt
+//
+// Usage: bpftrace veth_bql_inflight.bt
+// Interval output is a single compact line for easy script parsing.
+
+kprobe:veth_xmit
+{
+	@xmit_dev[tid] = arg1;
+}
+
+kretprobe:veth_xmit
+{
+	$dev = (struct net_device *)@xmit_dev[tid];
+	delete(@xmit_dev[tid]);
+
+	if ($dev == 0) {
+		return;
+	}
+
+	if ($dev->name != "veth_bql0") {
+		return;
+	}
+
+	$txq = $dev->_tx;
+	$num_queued    = $txq->dql.num_queued;
+	$num_completed = $txq->dql.num_completed;
+	$limit         = $txq->dql.limit;
+	$state         = $txq->state;
+
+	$inflight = (int64)($num_queued - $num_completed);
+
+	@inflight = lhist($inflight, 0, 257, 1);
+	@limit_val = lhist($limit, 0, 257, 1);
+	@inflight_stats = stats($inflight);
+	@limit_stats = stats($limit);
+	@total++;
+
+	if ($inflight > @max_inflight) {
+		@max_inflight = $inflight;
+	}
+	if ($limit > @max_limit) {
+		@max_limit = $limit;
+	}
+
+	// Track queue stop state
+	@stack_xoff += ($state >> 1) & 1;
+	@drv_xoff   += $state & 1;
+}
+
+interval:s:5
+{
+	printf("bql_inflight: xmits=%llu max_inflight=%llu max_limit=%llu stack_xoff=%llu drv_xoff=%llu\n",
+	       @total, @max_inflight, @max_limit, @stack_xoff, @drv_xoff);
+	clear(@total);
+	clear(@stack_xoff);
+	clear(@drv_xoff);
+}
+
+END
+{
+	printf("\n--- BQL inflight histogram (VETH_BQL_UNIT=1, values = packets) ---\n");
+	print(@inflight);
+	printf("\n--- BQL limit histogram (auto-tuned, values = packets) ---\n");
+	print(@limit_val);
+	print(@inflight_stats);
+	print(@limit_stats);
+	clear(@xmit_dev);
+	clear(@inflight);
+	clear(@limit_val);
+	clear(@inflight_stats);
+	clear(@limit_stats);
+	clear(@total);
+	clear(@stack_xoff);
+	clear(@drv_xoff);
+}
