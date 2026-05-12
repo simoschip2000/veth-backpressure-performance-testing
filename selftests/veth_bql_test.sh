@@ -108,6 +108,8 @@ if [ -z "$RESULTSDIR" ]; then
     RESULTSDIR="$REPO_ROOT/results/selftests/$(date +%Y-%m-%dT%H-%M-%S)"
     mkdir -p "$RESULTSDIR"
     ln -sfn "$(basename "$RESULTSDIR")" "$REPO_ROOT/results/selftests/latest"
+    # Record command line for easy re-run (bare metal mode)
+    echo "sudo $0 $*" > "$RESULTSDIR/cmdline.sh"
 fi
 
 FLOOD_PID=""

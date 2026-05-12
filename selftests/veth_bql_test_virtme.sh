@@ -79,6 +79,9 @@ ln -sfn "$(basename "$RESULTSDIR")" "$REPO_ROOT/results/selftests/latest"
 LOGFILE="$RESULTSDIR/veth_bql_test.log"
 CONSOLELOG="$RESULTSDIR/veth_bql_console.log"
 
+# Record command line for easy re-run (copy-paste ready)
+echo "cd $(pwd) && $0 $*" > "$RESULTSDIR/cmdline.sh"
+
 echo "Starting VM..."
 echo "  kernel tree: $(pwd)"
 echo "  selftest dir: $SCRIPTDIR"
