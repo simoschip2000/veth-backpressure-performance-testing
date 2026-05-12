@@ -12,7 +12,7 @@ qdisc, causing head-of-line blocking and ping drops under load.
 ### Install dependencies
 
 ```bash
-apt install python3-virtualenv gnuplot ttyplot
+apt install python3-virtualenv gnuplot ttyplot jq ethtool iptables
 ```
 
 ### Run
@@ -20,7 +20,8 @@ apt install python3-virtualenv gnuplot ttyplot
 ```bash
 ./setup.sh              # create netns + veth pair + iptables rules
 ./server.sh             # in another terminal: start bbperf UDP server
-./tests.sh              # run tests: no_qdisc, fq_codel, codel, sfq, mq
+./tests.sh              # run tests: no_qdisc, fq_codel, codel, sfq,
+                        #            mq_fq_codel_qdisc, mq_sfq_qdisc
 ```
 
 Results are written to stdout. Graphs are saved as PNG files in the
