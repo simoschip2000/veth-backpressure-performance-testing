@@ -95,8 +95,7 @@ SERIAL_CONSOLE="earlycon=uart8250,io,0x2f8,115200"
 SERIAL_CONSOLE+=" console=uart8250,io,0x2f8,115200"
 set +e
 vng $VERBOSE --cpus 4 --memory 2G \
-    --rwdir "$SCRIPTDIR" \
-    --rwdir "$RESULTSDIR" \
+    --rwdir "$REPO_ROOT" \
     --append "panic=5 loglevel=4 $SERIAL_CONSOLE" \
     --qemu-opts="-serial file:$CONSOLELOG" \
     --exec "cd $SCRIPTDIR && \
