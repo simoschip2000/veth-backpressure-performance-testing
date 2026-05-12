@@ -61,6 +61,7 @@ TINY_FLOOD=0      # 1 to add 2nd UDP thread with min-size packets
 BQL_MIN_LIMIT=""   # set DQL limit_min (e.g. 8 for one cache-line of ptr_ring)
 PRINT_HIST=0      # 1 to print bpftrace histograms at end
 BURST_SPEC=""     # burst spec 'N:Mus' e.g. '100:500' = 100 pkts then 500us pause
+TX_USECS=""       # ethtool tx-usecs for BQL completion coalescing (0=per-pkt)
 VETH_A="veth_bql0"
 VETH_B="veth_bql1"
 IP_A="10.99.0.1"
@@ -80,6 +81,7 @@ usage() {
     echo "  --tiny-flood     add 2nd UDP thread with min-size packets (stress BQL bytes)"
     echo "  --bql-min-limit N set DQL limit_min to N (e.g. 8 for cache-line ptr_ring)"
     echo "  --hist           print bpftrace histograms at end"
+    echo "  --tx-usecs N     set ethtool tx-usecs for BQL coalescing (0=per-pkt, default=kernel)"
     echo "  --burst N:Mus    bursty traffic: N pkts then M us pause (e.g. '100:500')"
     exit 1
 }
@@ -96,6 +98,7 @@ while [ $# -gt 0 ]; do
     --tiny-flood) TINY_FLOOD=1; shift ;;
     --bql-min-limit) BQL_MIN_LIMIT="$2"; shift 2 ;;
     --hist)       PRINT_HIST=1; shift ;;
+    --tx-usecs)   TX_USECS="$2"; shift 2 ;;
     --burst)      BURST_SPEC="$2"; shift 2 ;;
     --help|-h)    usage ;;
     *)            echo "Unknown option: $1" >&2; usage ;;
@@ -244,8 +247,13 @@ check_bql_sysfs() {
             log_info "BQL limit_min set to $BQL_MIN_LIMIT"
         fi
     else
-        log_info "BQL sysfs absent (veth IFF_NO_QUEUE+lltx, DQL accounting still active)"
+        log_info "BQL sysfs absent -- kernel likely missing veth BQL patchset"
         BQL_DIR=""
+    fi
+    if [ -n "$TX_USECS" ]; then
+        ethtool -C "$VETH_A" tx-usecs "$TX_USECS" 2>/dev/null && \
+            log_info "ethtool tx-usecs set to $TX_USECS" || \
+            log_info "ethtool tx-usecs not supported (kernel missing coalescing patch?)"
     fi
 }
 
