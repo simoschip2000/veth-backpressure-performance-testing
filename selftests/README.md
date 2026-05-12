@@ -13,13 +13,26 @@ Related upstream patchset:
 |-----------------------------|----------------------------------------------------------------|
 | `veth_bql_test.sh`          | Inner test (runs inside VM or bare metal with root)            |
 | `veth_bql_test_virtme.sh`   | Wrapper that boots a virtme-ng VM and runs the inner test      |
+| `udp_flood.c`               | UDP flood generator with per-packet timestamps                 |
+| `udp_sink.c`                | UDP sink with latency measurement and drop tracking            |
+| `Makefile`                  | Builds `udp_flood` and `udp_sink`                              |
 | `veth_bql_inflight.bt`      | bpftrace script for BQL inflight/limit histograms              |
 | `napi_poll_hist.bt`         | bpftrace script for NAPI poll work histograms                  |
 | `lib.sh`, `lib/sh/defer.sh` | Kernel kselftest library (from `tools/testing/selftests/net/`) |
 
+## Build
+
+```bash
+cd selftests
+make
+```
+
+The virtme wrapper (`veth_bql_test_virtme.sh`) runs `make` automatically.
+
 ## Prerequisites
 
-- **virtme-ng (vng)** installed
+- **gcc** for building the C tools
+- **virtme-ng (vng)** installed (for VM-based testing)
 - A compiled kernel tree with `vmlinux` and `.config` containing:
   `CONFIG_BQL=y`, `CONFIG_VETH=y`, `CONFIG_NET_SCH_SFQ=m`,
   `CONFIG_NET_SCH_FQ_CODEL=m`, and the virtio options for vng
@@ -96,4 +109,12 @@ The inner test can run directly on a machine with root:
 sudo ./veth_bql_test.sh --duration 25 --qdisc sfq
 ```
 
-This requires the running kernel to have BQL veth support.
+This requires the running kernel to have BQL veth support and
+pre-built binaries (`make` in this directory first).
+
+## Results
+
+Test output is saved to `results/selftests/<timestamp>/` with a
+`results/selftests/latest` symlink pointing to the most recent run.
+Each run directory contains: `veth_bql_test.log`, `veth_bql_console.log`,
+`ping.log`, and bpftrace logs (`napi_poll.log`, `bql_inflight.log`).

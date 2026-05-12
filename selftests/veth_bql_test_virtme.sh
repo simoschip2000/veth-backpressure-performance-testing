@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: GPL-2.0
 # Launch veth BQL test inside virtme-ng
 #
-# Must be run from the kernel build tree root.
+# Must be run from a compiled kernel build tree (needs vmlinux).
+# Builds C tools on the host, creates a timestamped results directory,
+# then boots a VM and runs the inner test.
 #
 # Options:
 #   --verbose       Show kernel console (vng boot messages) in real time.
@@ -10,9 +12,9 @@
 #   All other options are forwarded to veth_bql_test.sh (see --help there).
 #
 # Examples (run from kernel tree root):
-#   ./tools/testing/selftests/net/veth_bql_test_virtme.sh [OPTIONS]
-#     --duration 20 --nrules 1000
-#     --qdisc fq_codel --bql-disable
+#   cd /path/to/kernel && /path/to/veth_bql_test_virtme.sh [OPTIONS]
+#     --qdisc fq_codel --hist
+#     --qdisc sfq --bql-disable
 #     --verbose --qdisc-replace --duration 60
 
 set -eu
@@ -61,14 +63,29 @@ if [ -n "$MISSING" ]; then
 fi
 
 # Locate selftest scripts relative to this wrapper.
-TESTDIR="$(dirname "$(readlink -f "$0")")"
+SCRIPTDIR="$(dirname "$(readlink -f "$0")")"
+REPO_ROOT="$(dirname "$SCRIPTDIR")"
 TESTNAME="veth_bql_test.sh"
-LOGFILE="veth_bql_test.log"
-LOGPATH="$TESTDIR/$LOGFILE"
-CONSOLELOG="veth_bql_console.log"
-rm -f "$LOGPATH" "$CONSOLELOG"
 
-echo "Starting VM... test output in $LOGPATH, kernel console in $CONSOLELOG"
+# Build C tools on the host (binaries visible inside VM via --rwdir).
+echo "Building tools..."
+make -C "$SCRIPTDIR" || { echo "ERROR: make failed" >&2; exit 1; }
+
+# Create timestamped results directory on host (persisted via --rwdir).
+export RESULTSDIR="$REPO_ROOT/results/selftests/$(date +%Y-%m-%dT%H-%M-%S)"
+mkdir -p "$RESULTSDIR"
+ln -sfn "$(basename "$RESULTSDIR")" "$REPO_ROOT/results/selftests/latest"
+
+LOGFILE="$RESULTSDIR/veth_bql_test.log"
+CONSOLELOG="$RESULTSDIR/veth_bql_console.log"
+
+# Record command line for easy re-run (copy-paste ready)
+echo "cd $(pwd) && $0 $*" > "$RESULTSDIR/cmdline.sh"
+
+echo "Starting VM..."
+echo "  kernel tree: $(pwd)"
+echo "  selftest dir: $SCRIPTDIR"
+echo "  results dir: $RESULTSDIR"
 echo "(VM is booting, please wait ~30s)"
 
 # Always capture kernel console to a file via a second QEMU serial port.
@@ -81,12 +98,12 @@ SERIAL_CONSOLE="earlycon=uart8250,io,0x2f8,115200"
 SERIAL_CONSOLE+=" console=uart8250,io,0x2f8,115200"
 set +e
 vng $VERBOSE --cpus 4 --memory 2G \
-    --rwdir "$TESTDIR" \
+    --rwdir "$REPO_ROOT" \
     --append "panic=5 loglevel=4 $SERIAL_CONSOLE" \
     --qemu-opts="-serial file:$CONSOLELOG" \
-    --exec "cd $TESTDIR && \
-        ./$TESTNAME $TEST_ARGS 2>&1 | \
-        tee $LOGFILE; echo EXIT_CODE=\$? >> $LOGFILE"
+    --exec "cd $SCRIPTDIR && \
+        RESULTSDIR=$RESULTSDIR ./$TESTNAME $TEST_ARGS 2>&1 | \
+        tee $RESULTSDIR/veth_bql_test.log; echo EXIT_CODE=\$? >> $RESULTSDIR/veth_bql_test.log"
 VNG_RC=$?
 set -e
 
@@ -107,11 +124,12 @@ if [ "$VNG_RC" -ne 0 ]; then
         echo "  $0 --verbose ${INNER_ARGS[*]}"
     fi
     exit 1
-elif [ ! -f "$LOGPATH" ]; then
+elif [ ! -f "$LOGFILE" ]; then
     echo "No log file found -- VM may have crashed before writing output"
     exit 2
 else
     echo "=== VM finished ==="
+    echo "Results: $RESULTSDIR"
 fi
 
 # Scan console log for unexpected kernel warnings (even on clean exit)

@@ -45,7 +45,8 @@
 #   Below that rate the NAPI-64 cycle exceeds the target and fq_codel
 #   starts dropping.  Use --nrules and --qdisc-opts to experiment.
 #
-cd "$(dirname -- "$0")" || exit 1
+SCRIPTDIR="$(cd "$(dirname -- "$0")" && pwd)"
+cd "$SCRIPTDIR" || exit 1
 source lib.sh
 
 # Defaults
@@ -60,6 +61,7 @@ TINY_FLOOD=0      # 1 to add 2nd UDP thread with min-size packets
 BQL_MIN_LIMIT=""   # set DQL limit_min (e.g. 8 for one cache-line of ptr_ring)
 PRINT_HIST=0      # 1 to print bpftrace histograms at end
 BURST_SPEC=""     # burst spec 'N:Mus' e.g. '100:500' = 100 pkts then 500us pause
+TX_USECS=""       # ethtool tx-usecs for BQL completion coalescing (0=per-pkt)
 VETH_A="veth_bql0"
 VETH_B="veth_bql1"
 IP_A="10.99.0.1"
@@ -79,6 +81,7 @@ usage() {
     echo "  --tiny-flood     add 2nd UDP thread with min-size packets (stress BQL bytes)"
     echo "  --bql-min-limit N set DQL limit_min to N (e.g. 8 for cache-line ptr_ring)"
     echo "  --hist           print bpftrace histograms at end"
+    echo "  --tx-usecs N     set ethtool tx-usecs for BQL coalescing (0=per-pkt, default=kernel)"
     echo "  --burst N:Mus    bursty traffic: N pkts then M us pause (e.g. '100:500')"
     exit 1
 }
@@ -95,13 +98,22 @@ while [ $# -gt 0 ]; do
     --tiny-flood) TINY_FLOOD=1; shift ;;
     --bql-min-limit) BQL_MIN_LIMIT="$2"; shift 2 ;;
     --hist)       PRINT_HIST=1; shift ;;
+    --tx-usecs)   TX_USECS="$2"; shift 2 ;;
     --burst)      BURST_SPEC="$2"; shift 2 ;;
     --help|-h)    usage ;;
     *)            echo "Unknown option: $1" >&2; usage ;;
     esac
 done
 
-TMPDIR=$(mktemp -d)
+# Results directory: use RESULTSDIR from env (set by virtme wrapper) or create one.
+if [ -z "$RESULTSDIR" ]; then
+    REPO_ROOT="$(dirname "$SCRIPTDIR")"
+    RESULTSDIR="$REPO_ROOT/results/selftests/$(date +%Y-%m-%dT%H-%M-%S)"
+    mkdir -p "$RESULTSDIR"
+    ln -sfn "$(basename "$RESULTSDIR")" "$REPO_ROOT/results/selftests/latest"
+    # Record command line for easy re-run (bare metal mode)
+    echo "sudo $0 $*" > "$RESULTSDIR/cmdline.sh"
+fi
 
 FLOOD_PID=""
 FLOOD2_PID=""
@@ -121,305 +133,22 @@ cleanup() {
     cleanup_all_ns
     ip link del "$VETH_A" 2>/dev/null || true
     [ -n "$ORIG_WMEM_MAX" ] && sysctl -qw net.core.wmem_max="$ORIG_WMEM_MAX"
-    rm -rf "$TMPDIR"
+    log_info "Results: $RESULTSDIR"
 }
 trap cleanup EXIT
 
-require_command gcc
 require_command ethtool
 require_command tc
 
+# Verify pre-built binaries exist
+for tool in udp_flood udp_sink; do
+    if [ ! -x "$SCRIPTDIR/$tool" ]; then
+        echo "ERROR: $SCRIPTDIR/$tool not found. Run 'make -C $SCRIPTDIR' first." >&2
+        exit $ksft_fail
+    fi
+done
+
 # --- Function definitions ---
-
-compile_tools() {
-    echo "--- Compiling UDP flood tool ---"
-cat > "$TMPDIR"/udp_flood.c << 'CEOF'
-#include <arpa/inet.h>
-#include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <time.h>
-#include <unistd.h>
-
-static volatile int running = 1;
-
-static void stop(int sig) { running = 0; }
-
-struct pkt_hdr {
-	struct timespec ts;
-	unsigned long seq;
-};
-
-int main(int argc, char **argv)
-{
-	struct sockaddr_in dst;
-	struct pkt_hdr hdr;
-	unsigned long count = 0;
-	char buf[1500];
-	int sndbuf = 1048576;
-	int pkt_size, max_pkt_size;
-	int cur_size;
-	int duration;
-	int burst_pkts = 0;   /* 0 = continuous (no burst) */
-	int burst_pause_us = 0;
-	int fd;
-
-	const char *label = "flood";
-
-	if (argc < 5) {
-		fprintf(stderr, "Usage: %s <ip> <pkt_size> <port> <duration> [max_pkt_size] [label] [burst_pkts:pause_us]\n",
-			argv[0]);
-		return 1;
-	}
-
-	pkt_size = atoi(argv[2]);
-	if (pkt_size < (int)sizeof(struct pkt_hdr))
-		pkt_size = sizeof(struct pkt_hdr);
-	if (pkt_size > (int)sizeof(buf))
-		pkt_size = sizeof(buf);
-	max_pkt_size = (argc > 5 && argv[5][0] != '\0') ? atoi(argv[5]) : pkt_size;
-	if (max_pkt_size < pkt_size)
-		max_pkt_size = pkt_size;
-	if (max_pkt_size > (int)sizeof(buf))
-		max_pkt_size = sizeof(buf);
-	duration = atoi(argv[4]);
-	if (argc > 6)
-		label = argv[6];
-	if (argc > 7) {
-		char *colon = strchr(argv[7], ':');
-		if (colon) {
-			burst_pkts = atoi(argv[7]);
-			burst_pause_us = atoi(colon + 1);
-			fprintf(stderr, "  %s: burst mode %d pkts, %d us pause\n",
-				label, burst_pkts, burst_pause_us);
-		}
-	}
-
-	memset(&dst, 0, sizeof(dst));
-	dst.sin_family = AF_INET;
-	dst.sin_port = htons(atoi(argv[3]));
-	inet_pton(AF_INET, argv[1], &dst.sin_addr);
-
-	fd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (fd < 0) {
-		perror("socket");
-		return 1;
-	}
-
-	/* Raise send buffer so sk_wmem_alloc limit doesn't cap
-	 * in-flight packets before the ptr_ring (256 entries) fills.
-	 * Default wmem_default ~208K only allows ~93 packets.
-	 */
-	setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-
-	memset(buf, 0xAA, sizeof(buf));
-	signal(SIGINT, stop);
-	signal(SIGTERM, stop);
-	signal(SIGALRM, stop);
-	alarm(duration);
-
-	while (running) {
-		if (max_pkt_size > pkt_size)
-			cur_size = pkt_size + (rand() % (max_pkt_size - pkt_size + 1));
-		else
-			cur_size = pkt_size;
-		clock_gettime(CLOCK_MONOTONIC, &hdr.ts);
-		hdr.seq = count;
-		memcpy(buf, &hdr, sizeof(hdr));
-		sendto(fd, buf, cur_size, MSG_DONTWAIT,
-		       (struct sockaddr *)&dst, sizeof(dst));
-		count++;
-		if (!(count % 10000000))
-			fprintf(stderr, "  %s: %lu M packets\n",
-				label, count / 1000000);
-
-		/* Burst mode: send burst_pkts, then pause */
-		if (burst_pkts > 0 && (count % burst_pkts) == 0)
-			usleep(burst_pause_us);
-	}
-
-	fprintf(stderr, "  %s: total %lu packets (%.1f M)\n",
-		label, count, (double)count / 1e6);
-	close(fd);
-	return 0;
-}
-CEOF
-gcc -O2 -Wall -o "$TMPDIR"/udp_flood "$TMPDIR"/udp_flood.c || exit $ksft_fail
-
-# UDP sink with latency measurement
-cat > "$TMPDIR"/udp_sink.c << 'CEOF'
-#include <arpa/inet.h>
-#include <math.h>
-#include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <time.h>
-#include <unistd.h>
-
-static volatile int running = 1;
-
-static void stop(int sig) { running = 0; }
-
-struct pkt_hdr {
-	struct timespec ts;
-	unsigned long seq;
-};
-
-static const char *label = "sink";
-
-static void print_periodic(unsigned long count, unsigned long delta_count,
-			   double delta_sec, unsigned long drops,
-			   unsigned long reorders,
-			   double lat_min, double lat_sum,
-			   double lat_max)
-{
-	unsigned long pps;
-
-	if (!count)
-		return;
-	pps = delta_sec > 0 ? (unsigned long)(delta_count / delta_sec) : 0;
-	fprintf(stderr, "  %s: %lu pkts (%lu pps)  drops=%lu  reorders=%lu"
-		"  latency min/avg/max = %.3f/%.3f/%.3f ms\n",
-		label, count, pps, drops, reorders,
-		lat_min * 1e3, (lat_sum / count) * 1e3,
-		lat_max * 1e3);
-}
-
-static void print_final(unsigned long count, double elapsed_sec,
-			unsigned long drops, unsigned long reorders,
-			double lat_min, double lat_sum,
-			double lat_sum_sq, double lat_max)
-{
-	unsigned long pps;
-	double avg, stddev;
-
-	if (!count)
-		return;
-	pps = elapsed_sec > 0 ? (unsigned long)(count / elapsed_sec) : 0;
-	avg = lat_sum / count;
-	stddev = sqrt(lat_sum_sq / count - avg * avg);
-	fprintf(stderr, "  %s: %lu pkts (%lu avg pps)  drops=%lu  reorders=%lu"
-		"  latency min/avg/max/stddev = %.3f/%.3f/%.3f/%.3f ms\n",
-		label, count, pps, drops, reorders,
-		lat_min * 1e3, avg * 1e3,
-		lat_max * 1e3, stddev * 1e3);
-}
-
-int main(int argc, char **argv)
-{
-	unsigned long next_seq = 0, drops = 0, reorders = 0;
-	double lat_min = 1e9, lat_max = 0, lat_sum = 0, lat_sum_sq = 0;
-	unsigned long count = 0, last_count = 0;
-	struct sockaddr_in addr;
-	char buf[2048];
-	int fd, one = 1;
-
-	if (argc < 2) {
-		fprintf(stderr, "Usage: %s <port> [label]\n", argv[0]);
-		return 1;
-	}
-	if (argc >= 3)
-		label = argv[2];
-
-	fd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (fd < 0) {
-		perror("socket");
-		return 1;
-	}
-	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-
-	/* Timeout so recv() unblocks periodically to check 'running' flag.
-	 * Needed because glibc signal() sets SA_RESTART, so SIGTERM
-	 * does not interrupt recv().
-	 */
-	struct timeval tv = { .tv_sec = 1 };
-	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-	memset(&addr, 0, sizeof(addr));
-	addr.sin_family = AF_INET;
-	addr.sin_port = htons(atoi(argv[1]));
-	addr.sin_addr.s_addr = INADDR_ANY;
-	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		perror("bind");
-		return 1;
-	}
-
-	signal(SIGINT, stop);
-	signal(SIGTERM, stop);
-
-	struct timespec t_start, t_last_print;
-
-	clock_gettime(CLOCK_MONOTONIC, &t_start);
-	t_last_print = t_start;
-
-	while (running) {
-		struct pkt_hdr hdr;
-		struct timespec now;
-		ssize_t n;
-		double lat;
-
-		n = recv(fd, buf, sizeof(buf), 0);
-		if (n < (ssize_t)sizeof(struct pkt_hdr))
-			continue;
-
-		clock_gettime(CLOCK_MONOTONIC, &now);
-		memcpy(&hdr, buf, sizeof(hdr));
-
-		/* Track drops (gaps) and reorders (late arrivals) */
-		if (hdr.seq > next_seq)
-			drops += hdr.seq - next_seq;
-		if (hdr.seq < next_seq)
-			reorders++;
-		if (hdr.seq >= next_seq)
-			next_seq = hdr.seq + 1;
-
-		lat = (now.tv_sec - hdr.ts.tv_sec) +
-		      (now.tv_nsec - hdr.ts.tv_nsec) * 1e-9;
-
-		if (lat < lat_min)
-			lat_min = lat;
-		if (lat > lat_max)
-			lat_max = lat;
-		lat_sum += lat;
-		lat_sum_sq += lat * lat;
-		count++;
-
-		{
-			double since_print;
-
-			since_print = (now.tv_sec - t_last_print.tv_sec) +
-				      (now.tv_nsec - t_last_print.tv_nsec) * 1e-9;
-			if (since_print >= 5.0) {
-				print_periodic(count, count - last_count,
-					       since_print, drops,
-					       reorders, lat_min,
-					       lat_sum, lat_max);
-				last_count = count;
-				t_last_print = now;
-			}
-		}
-	}
-
-	{
-		struct timespec t_now;
-		double elapsed;
-
-		clock_gettime(CLOCK_MONOTONIC, &t_now);
-		elapsed = (t_now.tv_sec - t_start.tv_sec) +
-			  (t_now.tv_nsec - t_start.tv_nsec) * 1e-9;
-		print_final(count, elapsed, drops, reorders,
-			    lat_min, lat_sum, lat_sum_sq, lat_max);
-	}
-	close(fd);
-	return 0;
-}
-CEOF
-gcc -O2 -Wall -o "$TMPDIR"/udp_sink "$TMPDIR"/udp_sink.c -lm || exit $ksft_fail
-}
 
 setup_veth() {
     log_info "Setting up veth pair with GRO"
@@ -518,8 +247,13 @@ check_bql_sysfs() {
             log_info "BQL limit_min set to $BQL_MIN_LIMIT"
         fi
     else
-        log_info "BQL sysfs absent (veth IFF_NO_QUEUE+lltx, DQL accounting still active)"
+        log_info "BQL sysfs absent -- kernel likely missing veth BQL patchset"
         BQL_DIR=""
+    fi
+    if [ -n "$TX_USECS" ]; then
+        ethtool -C "$VETH_A" tx-usecs "$TX_USECS" 2>/dev/null && \
+            log_info "ethtool tx-usecs set to $TX_USECS" || \
+            log_info "ethtool tx-usecs not supported (kernel missing coalescing patch?)"
     fi
 }
 
@@ -528,20 +262,20 @@ start_traffic() {
     DMESG_BEFORE=$(dmesg | wc -l)
 
     log_info "Starting UDP sink in namespace"
-    ip netns exec "$NS" "$TMPDIR"/udp_sink "$PORT" "sink[${PKT_SIZE}B]" &
+    ip netns exec "$NS" "$SCRIPTDIR"/udp_sink "$PORT" "sink[${PKT_SIZE}B]" &
     SINK_PID=$!
     sleep 0.2
 
     log_info "Starting ping to $IP_B (5/s) to measure latency under load"
-    ping -i 0.2 -w "$DURATION" "$IP_B" > "$TMPDIR"/ping.log 2>&1 &
+    ping -i 0.2 -w "$DURATION" "$IP_B" > "$RESULTSDIR"/ping.log 2>&1 &
     PING_PID=$!
 
     if [ -n "$BURST_SPEC" ]; then
         log_info "Flooding ${PKT_SIZE}-byte UDP packets for ${DURATION}s (burst ${BURST_SPEC})"
-        "$TMPDIR"/udp_flood "$IP_B" "$PKT_SIZE" "$PORT" "$DURATION" "" "flood[${PKT_SIZE}B]" "$BURST_SPEC" &
+        "$SCRIPTDIR"/udp_flood "$IP_B" "$PKT_SIZE" "$PORT" "$DURATION" "" "flood[${PKT_SIZE}B]" "$BURST_SPEC" &
     else
         log_info "Flooding ${PKT_SIZE}-byte UDP packets for ${DURATION}s"
-        "$TMPDIR"/udp_flood "$IP_B" "$PKT_SIZE" "$PORT" "$DURATION" "" "flood[${PKT_SIZE}B]" &
+        "$SCRIPTDIR"/udp_flood "$IP_B" "$PKT_SIZE" "$PORT" "$DURATION" "" "flood[${PKT_SIZE}B]" &
     fi
     FLOOD_PID=$!
 
@@ -550,9 +284,9 @@ start_traffic() {
     # ptr_ring before STACK_XOFF fires -- exposing the dark buffer.
     if [ "$TINY_FLOOD" -eq 1 ]; then
         local port2=$((PORT + 1))
-        ip netns exec "$NS" "$TMPDIR"/udp_sink "$port2" "sink[24B]" &
+        ip netns exec "$NS" "$SCRIPTDIR"/udp_sink "$port2" "sink[24B]" &
         log_info "Starting 2nd UDP flood (min-size pkts) on port $port2"
-        "$TMPDIR"/udp_flood "$IP_B" 24 "$port2" "$DURATION" "" "flood[24B]" &
+        "$SCRIPTDIR"/udp_flood "$IP_B" 24 "$port2" "$DURATION" "" "flood[24B]" &
         FLOOD2_PID=$!
     fi
 
@@ -563,14 +297,14 @@ start_traffic() {
 
         local bt_napi="${bt_dir}/napi_poll_hist.bt"
         if [ -f "$bt_napi" ]; then
-            bpftrace "$bt_napi" > "$TMPDIR"/napi_poll.log 2>&1 &
+            bpftrace "$bt_napi" > "$RESULTSDIR"/napi_poll.log 2>&1 &
             BPFTRACE_PID=$!
             log_info "bpftrace napi_poll histogram started (pid=$BPFTRACE_PID)"
         fi
 
         local bt_bql="${bt_dir}/veth_bql_inflight.bt"
         if [ -f "$bt_bql" ]; then
-            bpftrace "$bt_bql" > "$TMPDIR"/bql_inflight.log 2>&1 &
+            bpftrace "$bt_bql" > "$RESULTSDIR"/bql_inflight.log 2>&1 &
             BPFTRACE2_PID=$!
             log_info "bpftrace BQL inflight histogram started (pid=$BPFTRACE2_PID)"
         fi
@@ -664,14 +398,14 @@ print_periodic_stats() {
         # shellcheck disable=SC2086  # word splitting on $line is intentional
         set -- $line
         local cur_p=$((0x${1})) cur_sq=$((0x${3}))
-        if [ -f "$TMPDIR/softnet_cpu${cpu}" ]; then
-            read -r prev_p prev_sq < "$TMPDIR/softnet_cpu${cpu}"
+        if [ -f "$RESULTSDIR/softnet_cpu${cpu}" ]; then
+            read -r prev_p prev_sq < "$RESULTSDIR/softnet_cpu${cpu}"
             local dp=$((cur_p - prev_p)) dsq=$((cur_sq - prev_sq))
             total_proc=$((total_proc + dp))
             total_sq=$((total_sq + dsq))
             [ "$dp" -gt 0 ] && active_cpus="${active_cpus} cpu${cpu}(+${dp})"
         fi
-        echo "$cur_p $cur_sq" > "$TMPDIR/softnet_cpu${cpu}"
+        echo "$cur_p $cur_sq" > "$RESULTSDIR/softnet_cpu${cpu}"
         cpu=$((cpu + 1))
     done < /proc/net/softnet_stat
     local n_active
@@ -689,21 +423,21 @@ print_periodic_stats() {
     fi
 
     # napi_poll histogram (from bpftrace, if running)
-    if [ -n "$BPFTRACE_PID" ] && [ -f "$TMPDIR"/napi_poll.log ]; then
+    if [ -n "$BPFTRACE_PID" ] && [ -f "$RESULTSDIR"/napi_poll.log ]; then
         local napi_line
-        napi_line=$(grep '^napi_poll:' "$TMPDIR"/napi_poll.log | tail -1)
+        napi_line=$(grep '^napi_poll:' "$RESULTSDIR"/napi_poll.log | tail -1)
         [ -n "$napi_line" ] && echo "  [${elapsed}s] $napi_line"
     fi
 
     # BQL inflight histogram (from bpftrace, if running)
-    if [ -n "$BPFTRACE2_PID" ] && [ -f "$TMPDIR"/bql_inflight.log ]; then
+    if [ -n "$BPFTRACE2_PID" ] && [ -f "$RESULTSDIR"/bql_inflight.log ]; then
         local bql_line
-        bql_line=$(grep '^bql_inflight:' "$TMPDIR"/bql_inflight.log | tail -1)
+        bql_line=$(grep '^bql_inflight:' "$RESULTSDIR"/bql_inflight.log | tail -1)
         [ -n "$bql_line" ] && echo "  [${elapsed}s] $bql_line"
     fi
 
     # Ping RTT
-    PING_RTT=$(tail -1 "$TMPDIR"/ping.log 2>/dev/null | grep -oP 'time=\K[0-9.]+') &&
+    PING_RTT=$(tail -1 "$RESULTSDIR"/ping.log 2>/dev/null | grep -oP 'time=\K[0-9.]+') &&
         echo "  [${elapsed}s] ping RTT=${PING_RTT}ms" || true
 }
 
@@ -716,7 +450,7 @@ monitor_loop() {
     while read -r line; do
         # shellcheck disable=SC2086  # word splitting on $line is intentional
         set -- $line
-        echo "$((0x${1})) $((0x${3}))" > "$TMPDIR/softnet_cpu${cpu}"
+        echo "$((0x${1})) $((0x${3}))" > "$RESULTSDIR/softnet_cpu${cpu}"
         cpu=$((cpu + 1))
     done < /proc/net/softnet_stat
     while kill -0 "$FLOOD_PID" 2>/dev/null; do
@@ -767,10 +501,10 @@ collect_results() {
     # Ping summary
     wait "$PING_PID" 2>/dev/null || true
     PING_PID=""
-    if [ -f "$TMPDIR"/ping.log ]; then
-        PING_LOSS=$(grep -o '[0-9.]*% packet loss' "$TMPDIR"/ping.log) &&
+    if [ -f "$RESULTSDIR"/ping.log ]; then
+        PING_LOSS=$(grep -o '[0-9.]*% packet loss' "$RESULTSDIR"/ping.log) &&
             log_info "Ping loss: $PING_LOSS"
-        PING_SUMMARY=$(tail -1 "$TMPDIR"/ping.log)
+        PING_SUMMARY=$(tail -1 "$RESULTSDIR"/ping.log)
         log_info "Ping summary: $PING_SUMMARY"
     fi
 
@@ -797,7 +531,7 @@ collect_results() {
 
     # Print bpftrace histograms if verbose
     if [ "$PRINT_HIST" -eq 1 ]; then
-        for logfile in "$TMPDIR"/napi_poll.log "$TMPDIR"/bql_inflight.log; do
+        for logfile in "$RESULTSDIR"/napi_poll.log "$RESULTSDIR"/bql_inflight.log; do
             if [ -f "$logfile" ]; then
                 echo ""
                 echo "=== $(basename "$logfile") ==="
@@ -819,7 +553,6 @@ collect_results() {
 
 test_bql_stress() {
     RET=$ksft_pass
-    compile_tools
     setup_veth
     install_qdisc "$QDISC" "$QDISC_OPTS"
     setup_iptables
@@ -841,7 +574,6 @@ test_qdisc_replace() {
     local idx
 
     RET=$ksft_pass
-    compile_tools
     setup_veth
     install_qdisc "$QDISC" "$QDISC_OPTS"
     setup_iptables
