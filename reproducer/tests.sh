@@ -9,7 +9,16 @@ source "${REPO_ROOT}/venv/bin/activate"
 SUDO=""
 [ "$(id -u)" -ne 0 ] && SUDO="sudo env PATH=$PATH"
 
+# Defaults
 TIME=60
+
+# Parse command line options
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --duration) TIME="$2"; shift 2 ;;
+    *) echo "Unknown option: $1" >&2; echo "Usage: $0 [--duration SEC]" >&2; exit 1 ;;
+  esac
+done
 
 DEV=server-link
 NS=router
