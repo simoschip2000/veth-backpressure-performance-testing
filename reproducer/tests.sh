@@ -27,12 +27,7 @@ if ! $SUDO ip netns exec server true 2>/dev/null; then
   exit 1
 fi
 
-# Verify bbperf server is listening (server.sh must be running)
-if ! $SUDO ip netns exec server ss -tlnp 2>/dev/null | grep -q ':5301'; then
-  echo "ERROR: bbperf server not listening on ${SERVER_IP}:5301." >&2
-  echo "       Start it with: ./reproducer/server.sh" >&2
-  exit 1
-fi
+# bbperf server check is done later — auto-started if not running
 
 # Results directory: results/reproducer/<timestamp>/ with 'latest' symlink
 TIMESTAMP=$(date +%Y-%m-%dT%H-%M-%S)
@@ -48,13 +43,37 @@ exec > >(tee "${RESULTS_DIR}/tests.log") 2>&1
 printf '%q ' "$0" "$@" > "${RESULTS_DIR}/cmdline.txt"
 echo >> "${RESULTS_DIR}/cmdline.txt"
 
-# Kill background ping on exit to avoid orphans
+# Start bbperf server if not already running, and clean up on exit
 PING_PID=""
+SERVER_PID=""
+OWN_SERVER=false
+
+if ! $SUDO ip netns exec server ss -tlnp 2>/dev/null | grep -q ':5301'; then
+  echo "Starting bbperf server in background..."
+  $SUDO ip netns exec server bbperf -s -B $SERVER_IP \
+    > "${RESULTS_DIR}/server.log" 2>&1 &
+  SERVER_PID=$!
+  OWN_SERVER=true
+  # Give server time to bind
+  sleep 0.5
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    echo "ERROR: bbperf server failed to start. See ${RESULTS_DIR}/server.log" >&2
+    exit 1
+  fi
+  echo "bbperf server started (pid $SERVER_PID, log: ${RESULTS_DIR}/server.log)"
+fi
+
 cleanup() {
   if [ -n "$PING_PID" ]; then
     kill "$PING_PID" 2>/dev/null || true
     wait "$PING_PID" 2>/dev/null || true
     PING_PID=""
+  fi
+  if [ "$OWN_SERVER" = true ] && [ -n "$SERVER_PID" ]; then
+    echo "Stopping bbperf server (pid $SERVER_PID)..."
+    $SUDO kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+    SERVER_PID=""
   fi
 }
 trap cleanup EXIT

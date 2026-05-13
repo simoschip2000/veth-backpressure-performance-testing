@@ -34,24 +34,21 @@ creating sustained backpressure on the router's `server-link` txq.
 apt install python3-virtualenv gnuplot ttyplot jq ethtool iptables
 ```
 
-Root is required for `ip netns` operations.
+Scripts use `sudo` automatically when not running as root.
 
 ## Run
 
-From the repo root, in two terminals:
-
 ```bash
-# Terminal 1: create namespaces, install bbperf into ../venv
-sudo ./reproducer/setup.sh
-
-# Terminal 2: start bbperf server
-sudo ./reproducer/server.sh
+./reproducer/setup.sh      # create namespaces, install bbperf
+./reproducer/tests.sh      # run test sweep (~6 min)
 ```
 
-Then in terminal 1, run the test sweep (~6 min):
+`tests.sh` auto-starts the bbperf server if it isn't already running
+(server output is saved to `server.log` in the results directory).
+You can also start it manually in a separate terminal if preferred:
 
 ```bash
-sudo ./reproducer/tests.sh
+./reproducer/server.sh
 ```
 
 This runs 6 qdisc configurations on the router's egress towards the
@@ -74,6 +71,7 @@ Test runs write results to `../results/reproducer/<timestamp>/` with a
 contains:
 
 - `tests.log` -- full stdout/stderr of the run
+- `server.log` -- bbperf server output (if auto-started)
 - `cmdline.txt` -- the exact command line used
 - `bbperf-graph-<test>.png` -- bbperf throughput/latency graphs
 - `<test>.json` -- raw bbperf JSON output
