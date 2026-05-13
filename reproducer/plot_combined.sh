@@ -115,7 +115,7 @@ fi
 # the gnuplot script are protected by escaping ($ is only special if
 # followed by a name; gnuplot syntax uses no shell-style $vars).
 cat > "${TMPDIR}/plot.gp" << GNUPLOT_HEADER
-set terminal pngcairo size 1200,700 enhanced font 'Arial,11'
+set terminal pngcairo size 1200,700 noenhanced font 'Arial,11'
 set output OUTPUT_PNG
 
 set title TITLE font 'Arial,14'
