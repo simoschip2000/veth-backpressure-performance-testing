@@ -17,6 +17,23 @@ NS=router
 DELAY=5
 PING_TIME=$((TIME - DELAY - 1))
 
+SERVER_IP=192.168.20.2
+CLIENT_IP=198.18.0.2
+
+# --- Pre-flight checks ---
+# Verify namespaces exist (setup.sh must be run first)
+if ! $SUDO ip netns exec server true 2>/dev/null; then
+  echo "ERROR: 'server' netns not found. Run ./reproducer/setup.sh first." >&2
+  exit 1
+fi
+
+# Verify bbperf server is listening (server.sh must be running)
+if ! $SUDO ip netns exec server ss -tlnp 2>/dev/null | grep -q ':5301'; then
+  echo "ERROR: bbperf server not listening on ${SERVER_IP}:5301." >&2
+  echo "       Start it with: ./reproducer/server.sh" >&2
+  exit 1
+fi
+
 # Results directory: results/reproducer/<timestamp>/ with 'latest' symlink
 TIMESTAMP=$(date +%Y-%m-%dT%H-%M-%S)
 RESULTS_DIR="${REPO_ROOT}/results/reproducer/${TIMESTAMP}"
@@ -31,18 +48,30 @@ exec > >(tee "${RESULTS_DIR}/tests.log") 2>&1
 printf '%q ' "$0" "$@" > "${RESULTS_DIR}/cmdline.txt"
 echo >> "${RESULTS_DIR}/cmdline.txt"
 
+# Kill background ping on exit to avoid orphans
+PING_PID=""
+cleanup() {
+  if [ -n "$PING_PID" ]; then
+    kill "$PING_PID" 2>/dev/null || true
+    wait "$PING_PID" 2>/dev/null || true
+    PING_PID=""
+  fi
+}
+trap cleanup EXIT
+
 run_test() {
   output=$1
   echo -e "\n=== $output === (runs for $TIME sec)"
   # start ping process in background
   (sleep $DELAY && echo "ping: started in background (runs for $PING_TIME sec)" && \
-   $SUDO ip netns exec client ping -w $PING_TIME -q -i 0.1 192.168.20.2)&
-  graph=$($SUDO ip netns exec client bbperf -t $TIME -u -c 192.168.20.2 -B 198.18.0.2 \
-            -g -J "${RESULTS_DIR}/${output}.json" \
-          | grep "created graph" | awk '{print $3}')
-  mv "$graph" "${RESULTS_DIR}/bbperf-graph-${output}.png"
+   $SUDO ip netns exec client ping -w $PING_TIME -q -i 0.1 $SERVER_IP)&
+  PING_PID=$!
+  $SUDO ip netns exec client bbperf -t $TIME -u -c $SERVER_IP -B $CLIENT_IP \
+            -g --graph-file "${RESULTS_DIR}/bbperf-graph-${output}.png" \
+            -J "${RESULTS_DIR}/${output}.json"
   # wait for background ping to complete
-  wait
+  wait "$PING_PID" 2>/dev/null || true
+  PING_PID=""
   # Qdisc output: Look for requeues
   $SUDO ip netns exec ${NS} tc -s qdisc ls dev ${DEV}
   # Interface stats: Look for TX dropped
