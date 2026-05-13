@@ -22,9 +22,8 @@ done
 
 DEV=server-link
 NS=router
-# Delay the ping test until elefant flow ramps up
-DELAY=5
-PING_TIME=$((TIME - DELAY - 1))
+# Warmup: exclude first N seconds from ping stats (elephant ramp-up)
+WARMUP=10
 
 SERVER_IP=192.168.20.2
 CLIENT_IP=198.18.0.2
@@ -87,23 +86,119 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Accumulate per-test results for summary table
+declare -a TEST_NAMES=()
+declare -a PING_AVGS=()
+declare -a PING_P99S=()
+declare -a PING_MAXS=()
+declare -a PING_LOSSES=()
+declare -a BBPERF_AVGS=()
+declare -a BBPERF_P99S=()
+
+parse_ping_stats() {
+  local logfile="$1"
+  local warmup="$2"
+  python3 -c "
+import re, sys
+warmup = float('${warmup}')
+lines = open('${logfile}').readlines()
+all_rtts = []
+for line in lines:
+    m = re.match(r'\[(\d+\.\d+)\].*time=([0-9.]+)\s*ms', line)
+    if m:
+        all_rtts.append((float(m.group(1)), float(m.group(2))))
+if not all_rtts:
+    print('- - - - -')
+    sys.exit(0)
+# Compute loss from summary line (handle floats like '2.04082% packet loss')
+loss = 0.0
+for line in lines:
+    m = re.search(r'([\d.]+)%\s*packet loss', line)
+    if m:
+        loss = float(m.group(1))
+        break
+t0 = all_rtts[0][0]
+# Steady-state: exclude warmup period
+steady = [rtt for ts, rtt in all_rtts if ts - t0 >= warmup]
+if not steady:
+    steady = [rtt for _, rtt in all_rtts]
+steady.sort()
+n = len(steady)
+p99_idx = min(int(n * 0.99), n - 1)
+avg = sum(steady) / n
+print(f'{avg:.1f} {steady[p99_idx]:.1f} {steady[-1]:.1f} {loss:.1f} {n}')
+"
+}
+
+parse_bbperf_stats() {
+  local jsonfile="$1"
+  python3 -c "
+import json, sys
+with open('${jsonfile}') as f:
+    d = json.load(f)
+valid = [e for e in d['entries'] if e.get('is_sample_valid')]
+if valid:
+    rtts = sorted(e['loaded_rtt_ms'] for e in valid)
+    n = len(rtts)
+    p99_idx = min(int(n * 0.99), n - 1)
+    avg = sum(rtts) / n
+    print(f'{avg:.1f} {rtts[p99_idx]:.1f}')
+else:
+    print('- -')
+"
+}
+
 run_test() {
   output=$1
   echo -e "\n=== $output === (runs for $TIME sec)"
-  # start ping process in background
-  (sleep $DELAY && echo "ping: started in background (runs for $PING_TIME sec)" && \
-   $SUDO ip netns exec client ping -w $PING_TIME -q -i 0.1 $SERVER_IP)&
+
+  # Start ping with per-packet timestamps (-D) in background.
+  # bbperf has ~8s UDP calibration before its test starts, so run ping
+  # longer than bbperf -t to cover both calibration and test phases.
+  local ping_deadline=$((TIME + 20))
+  local ping_log="${RESULTS_DIR}/ping-${output}.log"
+  ($SUDO ip netns exec client ping -D -w $ping_deadline -i 0.1 $SERVER_IP \
+     > "$ping_log" 2>&1)&
   PING_PID=$!
+
+  # Run bbperf elephant flow
   $SUDO ip netns exec client bbperf -t $TIME -u -c $SERVER_IP -B $CLIENT_IP \
             -g --graph-file "${RESULTS_DIR}/bbperf-graph-${output}.png" \
             -J "${RESULTS_DIR}/${output}.json"
-  # wait for background ping to complete
+
+  # Stop ping (it has a longer deadline to cover bbperf calibration)
+  $SUDO kill -INT "$PING_PID" 2>/dev/null || true
   wait "$PING_PID" 2>/dev/null || true
   PING_PID=""
+
+  # Print ping summary from log
+  echo "--- ping results (${output}) ---"
+  tail -3 "$ping_log" 2>/dev/null || echo "(no ping data)"
+
   # Qdisc output: Look for requeues
   $SUDO ip netns exec ${NS} tc -s qdisc ls dev ${DEV}
   # Interface stats: Look for TX dropped
   $SUDO ip -netns ${NS} -s link ls dev ${DEV}
+
+  # Generate combined graph with ping overlay
+  "${SCRIPT_DIR}/plot_combined.sh" \
+    "${RESULTS_DIR}/${output}.json" \
+    "$ping_log" \
+    "${RESULTS_DIR}/combined-${output}.png" \
+    "${output} (elephant UDP + ping RTT)" || true
+
+  # Collect stats for summary table
+  TEST_NAMES+=("$output")
+  local pstats
+  pstats=$(parse_ping_stats "$ping_log" "$WARMUP")
+  PING_AVGS+=($(echo "$pstats" | awk '{print $1}'))
+  PING_P99S+=($(echo "$pstats" | awk '{print $2}'))
+  PING_MAXS+=($(echo "$pstats" | awk '{print $3}'))
+  PING_LOSSES+=($(echo "$pstats" | awk '{print $4}'))
+  local bstats
+  bstats=$(parse_bbperf_stats "${RESULTS_DIR}/${output}.json")
+  BBPERF_AVGS+=($(echo "$bstats" | awk '{print $1}'))
+  BBPERF_P99S+=($(echo "$bstats" | awk '{print $2}'))
 }
 
 $SUDO ip netns exec ${NS} tc qdisc del dev ${DEV} root 2>/dev/null || true
@@ -137,3 +232,35 @@ for sq in $($SUDO ip netns exec ${NS} tc -j qdisc show dev ${DEV} | jq -r .[].pa
   $SUDO ip netns exec ${NS} tc qdisc replace dev ${DEV} parent ${sq} sfq
 done
 run_test "mq_sfq_qdisc"
+
+# --- Summary table ---
+# Print a single, consistently-formatted table to both stdout and summary.txt.
+# Build each value with its unit suffix first, then use a single %Ns column
+# width so headers and data align in monospace output.
+print_summary() {
+  printf "%-22s %10s %10s %10s %10s  %12s %12s\n" \
+         "qdisc" "ping_avg" "ping_p99" "ping_max" "ping_loss" "bbperf_avg" "bbperf_p99"
+  printf "%-22s %10s %10s %10s %10s  %12s %12s\n" \
+         "-----" "--------" "--------" "--------" "---------" "----------" "----------"
+  for i in "${!TEST_NAMES[@]}"; do
+    printf "%-22s %10s %10s %10s %10s  %12s %12s\n" \
+      "${TEST_NAMES[$i]}" \
+      "${PING_AVGS[$i]}ms" "${PING_P99S[$i]}ms" "${PING_MAXS[$i]}ms" \
+      "${PING_LOSSES[$i]}%" \
+      "${BBPERF_AVGS[$i]}ms" "${BBPERF_P99S[$i]}ms"
+  done
+}
+
+echo ""
+echo "========================================"
+echo "  Summary: ping latency under load"
+echo "  (steady-state: excluding first ${WARMUP}s warmup)"
+echo "========================================"
+print_summary
+echo "========================================"
+echo ""
+echo "Results saved to: ${RESULTS_DIR}"
+echo "Combined graphs:  ${RESULTS_DIR}/combined-*.png"
+
+# Save summary to file (no banner, just the table)
+print_summary > "${RESULTS_DIR}/summary.txt"
