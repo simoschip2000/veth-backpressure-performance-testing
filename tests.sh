@@ -16,7 +16,7 @@ run_test() {
   # start ping process in background
   (sleep $DELAY && echo "ping: started in background (runs for $PING_TIME sec)" && \
    ip netns exec client ping -w $PING_TIME -q -i 0.1 192.168.20.2)&
-  graph=$(ip netns exec client bbperf -t $TIME -u -c 192.168.20.2 -B 192.168.20.1 -g -J $output.json | grep "created graph" | awk '{print $3}')
+  graph=$(ip netns exec client bbperf -t $TIME -u -c 192.168.20.2 -B 198.18.0.2 -g -J $output.json | grep "created graph" | awk '{print $3}')
   mv $graph ./bbperf-graph-$output.png
   # wait for background ping to complete
   wait
@@ -26,7 +26,7 @@ run_test() {
   ip -netns ${NS} -s link ls dev ${DEV}
 }
 
-ip netns exec ${NS} tc qdisc del dev ${DEV} root || true
+ip netns exec ${NS} tc qdisc del dev ${DEV} root 2>/dev/null || true
 run_test "no_qdisc"
 
 ip netns exec ${NS} tc qdisc replace dev ${DEV} root fq_codel
