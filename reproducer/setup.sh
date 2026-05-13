@@ -1,6 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
+# Repo root is the parent dir of this script's location
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
 #MQ=yes
 MQ=no
 
@@ -68,7 +71,7 @@ echo "COMMIT"
 )
 '
 
-# install bbperf
-[ ! -d venv ] && virtualenv venv
-source ./venv/bin/activate
+# install bbperf (shared venv at repo root; selftests may use it too)
+[ ! -d "${REPO_ROOT}/venv" ] && virtualenv "${REPO_ROOT}/venv"
+source "${REPO_ROOT}/venv/bin/activate"
 pip3 install --upgrade bbperf
