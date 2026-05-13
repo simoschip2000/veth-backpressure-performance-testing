@@ -69,9 +69,18 @@ background ping started 5s after the elephant flow ramps up.
 
 ## Output
 
-Currently graphs (`bbperf-graph-*.png`) and JSON (`*.json`) land in
-the current working directory. Reference results from earlier runs
-are committed under `../results/reproducer/`.
+Test runs write results to `../results/reproducer/<timestamp>/` with a
+`latest` symlink pointing to the most recent run. Each run directory
+contains:
+
+- `tests.log` -- full stdout/stderr of the run
+- `cmdline.txt` -- the exact command line used
+- `bbperf-graph-<test>.png` -- bbperf throughput/latency graphs
+- `<test>.json` -- raw bbperf JSON output
+
+Reference results from earlier runs (host names rather than
+timestamps) are committed under `../results/reproducer/` for
+comparison.
 
 ## Interpreting Results
 

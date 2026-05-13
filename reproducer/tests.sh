@@ -1,6 +1,9 @@
 #!/bin/bash
 set -euo pipefail
-source "$(dirname "$0")/../venv/bin/activate"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+source "${REPO_ROOT}/venv/bin/activate"
 
 TIME=60
 
@@ -10,14 +13,30 @@ NS=router
 DELAY=5
 PING_TIME=$((TIME - DELAY - 1))
 
+# Results directory: results/reproducer/<timestamp>/ with 'latest' symlink
+TIMESTAMP=$(date +%Y-%m-%dT%H-%M-%S)
+RESULTS_DIR="${REPO_ROOT}/results/reproducer/${TIMESTAMP}"
+mkdir -p "${RESULTS_DIR}"
+ln -sfn "${TIMESTAMP}" "${REPO_ROOT}/results/reproducer/latest"
+echo "Results dir: ${RESULTS_DIR}"
+
+# Tee all output to a log file in the results dir
+exec > >(tee "${RESULTS_DIR}/tests.log") 2>&1
+
+# Record command line for easy re-run
+printf '%q ' "$0" "$@" > "${RESULTS_DIR}/cmdline.txt"
+echo >> "${RESULTS_DIR}/cmdline.txt"
+
 run_test() {
   output=$1
   echo -e "\n=== $output === (runs for $TIME sec)"
   # start ping process in background
   (sleep $DELAY && echo "ping: started in background (runs for $PING_TIME sec)" && \
    ip netns exec client ping -w $PING_TIME -q -i 0.1 192.168.20.2)&
-  graph=$(ip netns exec client bbperf -t $TIME -u -c 192.168.20.2 -B 198.18.0.2 -g -J $output.json | grep "created graph" | awk '{print $3}')
-  mv $graph ./bbperf-graph-$output.png
+  graph=$(ip netns exec client bbperf -t $TIME -u -c 192.168.20.2 -B 198.18.0.2 \
+            -g -J "${RESULTS_DIR}/${output}.json" \
+          | grep "created graph" | awk '{print $3}')
+  mv "$graph" "${RESULTS_DIR}/bbperf-graph-${output}.png"
   # wait for background ping to complete
   wait
   # Qdisc output: Look for requeues

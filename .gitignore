@@ -1,1 +1,6 @@
 results/selftests/
+
+# reproducer/tests.sh writes timestamped run dirs (YYYY-MM-DDTHH-MM-SS) plus
+# a 'latest' symlink. Reference results committed by hand are not ignored.
+results/reproducer/????-??-??T??-??-??
+results/reproducer/latest
