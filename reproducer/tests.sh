@@ -51,6 +51,45 @@ exec > >(tee "${RESULTS_DIR}/tests.log") 2>&1
 printf '%q ' "$0" "$@" > "${RESULTS_DIR}/cmdline.txt"
 echo >> "${RESULTS_DIR}/cmdline.txt"
 
+# Record system info for reproducibility
+{
+  echo "=== Kernel ==="
+  uname -r
+  echo ""
+  echo "=== Kernel version ==="
+  cat /proc/version
+  echo ""
+  echo "=== CPU ==="
+  lscpu | grep -E '^(Model name|Architecture|CPU\(s\)|Thread|Core|Socket|CPU max MHz|CPU min MHz)'
+  echo ""
+  echo "=== Memory ==="
+  free -h | head -2
+  echo ""
+  echo "=== bbperf ==="
+  pip show bbperf 2>/dev/null | grep -E '^(Name|Version):' || echo "bbperf version unknown"
+  echo ""
+  echo "=== veth BQL (${NS} netns, dev ${DEV}) ==="
+  bql_dir="/sys/devices/virtual/net/${DEV}/queues"
+  if $SUDO ip netns exec ${NS} test -d "${bql_dir}/tx-0/byte_queue_limits" 2>/dev/null; then
+    $SUDO ip netns exec ${NS} bash -c "
+      for q in ${bql_dir}/tx-*/byte_queue_limits; do
+        queue=\$(basename \$(dirname \$q))
+        max=\$(cat \$q/limit_max)
+        cur=\$(cat \$q/limit)
+        echo \"${DEV}/\${queue}: limit_max=\${max} limit=\${cur}\"
+      done
+    "
+    echo "veth BQL: SUPPORTED"
+  else
+    echo "veth BQL: NOT SUPPORTED (no byte_queue_limits in sysfs)"
+    echo "Kernel $(uname -r) does not have veth BQL backpressure."
+  fi
+  echo ""
+  echo "=== Test params ==="
+  echo "TIME=${TIME} WARMUP=${WARMUP}"
+  echo "date: $(date -Iseconds)"
+} > "${RESULTS_DIR}/sysinfo.txt" 2>&1
+
 # Start bbperf server if not already running, and clean up on exit
 PING_PID=""
 SERVER_PID=""
