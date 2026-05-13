@@ -187,6 +187,13 @@ run_test() {
     "${RESULTS_DIR}/combined-${output}.png" \
     "${output} (elephant UDP + ping RTT)" || true
 
+  # Generate bbperf-style multi-panel graph with ping overlay
+  "${SCRIPT_DIR}/plot_multi.sh" \
+    "${RESULTS_DIR}/${output}.json" \
+    "$ping_log" \
+    "${RESULTS_DIR}/multi-${output}.png" \
+    "${output}" || true
+
   # Collect stats for summary table
   TEST_NAMES+=("$output")
   local pstats
@@ -261,6 +268,7 @@ echo "========================================"
 echo ""
 echo "Results saved to: ${RESULTS_DIR}"
 echo "Combined graphs:  ${RESULTS_DIR}/combined-*.png"
+echo "Multi graphs:     ${RESULTS_DIR}/multi-*.png"
 
 # Save summary to file (no banner, just the table)
 print_summary > "${RESULTS_DIR}/summary.txt"
