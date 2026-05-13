@@ -1,45 +1,35 @@
 # veth Backpressure Performance Testing
 
 Tools for testing and measuring veth qdisc backpressure and BQL (Byte
-Queue Limits) behavior. This repository contains two independent test suites:
+Queue Limits) behavior. This repository contains two independent test
+suites:
 
-## Backpressure Reproducer (root directory)
+## [`reproducer/`](reproducer/README.md) -- Backpressure Reproducer
 
-The original dark-buffer latency reproducer by Chris Arges. Demonstrates
-how veth's 256-entry ptr_ring acts as a "dark buffer" hidden from the
-qdisc, causing head-of-line blocking and ping drops under load.
+Chris Arges' dark-buffer latency reproducer. Uses netns + `bbperf` to
+demonstrate how veth's 256-entry `ptr_ring` acts as a "dark buffer"
+hidden from the qdisc, causing head-of-line blocking and ping drops
+under load.
 
-### Install dependencies
+See [`reproducer/README.md`](reproducer/README.md) for details.
 
-```bash
-apt install python3-virtualenv gnuplot ttyplot jq ethtool iptables
-```
-
-### Run
-
-```bash
-./setup.sh              # create netns + veth pair + iptables rules
-./server.sh             # in another terminal: start bbperf UDP server
-./tests.sh              # run tests: no_qdisc, fq_codel, codel, sfq,
-                        #            mq_fq_codel_qdisc, mq_sfq_qdisc
-```
-
-Results are written to stdout. Graphs are saved as PNG files in the
-current directory.
-
-## BQL Selftest (`selftests/`)
+## [`selftests/`](selftests/README.md) -- BQL Selftest
 
 Stress test for the veth BQL patchset. Exercises BQL code paths under
 sustained UDP load, measures latency reduction, and detects DQL
-accounting bugs.
+accounting bugs (kernel BUG_ON/Oops).
 
-See [selftests/README.md](selftests/README.md) for full documentation.
+See [`selftests/README.md`](selftests/README.md) for details.
 
-### Quick start
+## Shared venv
+
+The `reproducer/` suite uses `bbperf` (installed via `pip` into a
+Python virtualenv). The venv lives at the repo root (`./venv/`) so it
+can be shared between suites:
 
 ```bash
-cd /path/to/kernel-tree
-/path/to/selftests/veth_bql_test_virtme.sh --qdisc fq_codel --hist
+apt install python3-virtualenv
+# venv is created automatically by reproducer/setup.sh on first run
 ```
 
 ## Related
