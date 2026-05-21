@@ -60,8 +60,12 @@ QDISC_REPLACE=0   # 1 to test qdisc replacement under active traffic
 TINY_FLOOD=0      # 1 to add 2nd UDP thread with min-size packets
 BQL_MIN_LIMIT=""   # set DQL limit_min (e.g. 8 for one cache-line of ptr_ring)
 PRINT_HIST=0      # 1 to print bpftrace histograms at end
+NO_BPFTRACE=0     # 1 to skip bpftrace histogram collection
 BURST_SPEC=""     # burst spec 'N:Mus' e.g. '100:500' = 100 pkts then 500us pause
 TX_USECS=""       # ethtool tx-usecs for BQL completion coalescing (0=per-pkt)
+USE_PKTGEN=0      # 1 to use kernel pktgen instead of udp_flood
+PKTGEN_SIZE=64    # pktgen packet size (default 64 for max pps)
+PKTGEN_THREADS=1  # number of pktgen kernel threads
 VETH_A="veth_bql0"
 VETH_B="veth_bql1"
 IP_A="10.99.0.1"
@@ -81,8 +85,12 @@ usage() {
     echo "  --tiny-flood     add 2nd UDP thread with min-size packets (stress BQL bytes)"
     echo "  --bql-min-limit N set DQL limit_min to N (e.g. 8 for cache-line ptr_ring)"
     echo "  --hist           print bpftrace histograms at end"
+    echo "  --no-bpftrace    skip bpftrace histogram collection"
     echo "  --tx-usecs N     set ethtool tx-usecs for BQL coalescing (0=per-pkt, default=kernel)"
     echo "  --burst N:Mus    bursty traffic: N pkts then M us pause (e.g. '100:500')"
+    echo "  --pktgen         use kernel pktgen instead of udp_flood (kernel-space TX)"
+    echo "  --pktgen-size N  pktgen packet size in bytes (default: $PKTGEN_SIZE)"
+    echo "  --pktgen-threads N pktgen kernel threads (default: $PKTGEN_THREADS)"
     exit 1
 }
 
@@ -98,8 +106,12 @@ while [ $# -gt 0 ]; do
     --tiny-flood) TINY_FLOOD=1; shift ;;
     --bql-min-limit) BQL_MIN_LIMIT="$2"; shift 2 ;;
     --hist)       PRINT_HIST=1; shift ;;
+    --no-bpftrace) NO_BPFTRACE=1; shift ;;
     --tx-usecs)   TX_USECS="$2"; shift 2 ;;
     --burst)      BURST_SPEC="$2"; shift 2 ;;
+    --pktgen)     USE_PKTGEN=1; shift ;;
+    --pktgen-size)  PKTGEN_SIZE="$2"; shift 2 ;;
+    --pktgen-threads) PKTGEN_THREADS="$2"; shift 2 ;;
     --help|-h)    usage ;;
     *)            echo "Unknown option: $1" >&2; usage ;;
     esac
@@ -121,12 +133,20 @@ SINK_PID=""
 PING_PID=""
 BPFTRACE_PID=""
 BPFTRACE2_PID=""
+PKTGEN_TIMER_PID=""
 
 # shellcheck disable=SC2329  # cleanup is invoked indirectly via trap
 cleanup() {
     [ -n "$BPFTRACE2_PID" ] && kill_process "$BPFTRACE2_PID"
     [ -n "$BPFTRACE_PID" ] && kill_process "$BPFTRACE_PID"
-    [ -n "$FLOOD_PID" ] && kill_process "$FLOOD_PID"
+    if [ "$USE_PKTGEN" -eq 1 ]; then
+        echo "stop" > /proc/net/pktgen/pgctrl 2>/dev/null || true
+        [ -n "$PKTGEN_TIMER_PID" ] && kill_process "$PKTGEN_TIMER_PID"
+        [ -n "$FLOOD_PID" ] && { wait "$FLOOD_PID" 2>/dev/null || true; }
+        echo "reset" > /proc/net/pktgen/pgctrl 2>/dev/null || true
+    else
+        [ -n "$FLOOD_PID" ] && kill_process "$FLOOD_PID"
+    fi
     [ -n "$FLOOD2_PID" ] && kill_process "$FLOOD2_PID"
     [ -n "$SINK_PID" ] && kill_process "$SINK_PID"
     [ -n "$PING_PID" ] && kill_process "$PING_PID"
@@ -140,13 +160,15 @@ trap cleanup EXIT
 require_command ethtool
 require_command tc
 
-# Verify pre-built binaries exist
-for tool in udp_flood udp_sink; do
-    if [ ! -x "$SCRIPTDIR/$tool" ]; then
-        echo "ERROR: $SCRIPTDIR/$tool not found. Run 'make -C $SCRIPTDIR' first." >&2
-        exit $ksft_fail
-    fi
-done
+# Verify pre-built binaries exist (not needed for pktgen mode)
+if [ "$USE_PKTGEN" -eq 0 ]; then
+    for tool in udp_flood udp_sink; do
+        if [ ! -x "$SCRIPTDIR/$tool" ]; then
+            echo "ERROR: $SCRIPTDIR/$tool not found. Run 'make -C $SCRIPTDIR' first." >&2
+            exit $ksft_fail
+        fi
+    done
+fi
 
 # --- Function definitions ---
 
@@ -257,6 +279,113 @@ check_bql_sysfs() {
     fi
 }
 
+pg_ctrl() {
+    local proc_file="/proc/net/pktgen/pgctrl"
+    echo "$1" > "$proc_file" || { echo "ERROR: pg_ctrl $1 failed" >&2; return 1; }
+}
+
+pg_thread() {
+    local thread=$1; shift
+    local proc_file="/proc/net/pktgen/kpktgend_${thread}"
+    echo "$@" > "$proc_file" || { echo "ERROR: pg_thread $thread $@ failed" >&2; return 1; }
+}
+
+pg_set() {
+    local dev=$1; shift
+    local proc_file="/proc/net/pktgen/$dev"
+    echo "$@" > "$proc_file" || { echo "ERROR: pg_set $dev $@ failed" >&2; return 1; }
+}
+
+start_traffic_pktgen() {
+    # Snapshot dmesg before test
+    DMESG_BEFORE=$(dmesg | wc -l)
+
+    # Uses pktgen "xmit_mode queue_xmit" to inject packets into the TX
+    # qdisc egress path via __dev_queue_xmit().  This exercises the full
+    # qdisc + BQL path without socket-layer gating (no sk_wmem_alloc).
+    # See samples/pktgen/pktgen_bench_xmit_mode_queue_xmit.sh
+    modprobe pktgen 2>/dev/null || \
+        { echo "ERROR: pktgen module not available"; exit $ksft_skip; }
+
+    [ -d "/proc/net/pktgen" ] || \
+        { echo "ERROR: /proc/net/pktgen not found"; exit $ksft_skip; }
+
+    local dst_mac
+    dst_mac=$(ip netns exec "$NS" cat /sys/class/net/"$VETH_B"/address)
+
+    # Reset any stale state from previous runs
+    pg_ctrl "reset"
+
+    local last_thread=$((PKTGEN_THREADS - 1))
+    for ((thread = 0; thread <= last_thread; thread++)); do
+        local dev="${VETH_A}@${thread}"
+        # Each thread gets a different dst port so flows hash into
+        # different qdisc buckets (e.g. fq_codel flow slots).
+        local dst_port=$((PORT + thread))
+
+        pg_thread $thread "rem_device_all"
+        pg_thread $thread "add_device" $dev
+
+        # Base config -- mirrors upstream pktgen_bench_xmit_mode_queue_xmit.sh
+        pg_set $dev "flag QUEUE_MAP_CPU"
+        pg_set $dev "flag NO_TIMESTAMP"
+        pg_set $dev "count 0"
+        pg_set $dev "pkt_size $PKTGEN_SIZE"
+        pg_set $dev "delay 0"
+
+        # Destination
+        pg_set $dev "dst_mac $dst_mac"
+        pg_set $dev "dst $IP_B"
+        pg_set $dev "udp_dst_min $dst_port"
+        pg_set $dev "udp_dst_max $dst_port"
+
+        # Inject into TX qdisc path (not ndo_start_xmit directly)
+        pg_set $dev "xmit_mode queue_xmit"
+    done
+
+    log_info "Starting ping to $IP_B (5/s) to measure latency under load"
+    ping -i 0.2 -w "$DURATION" "$IP_B" > "$RESULTSDIR"/ping.log 2>&1 &
+    PING_PID=$!
+
+    # pg_ctrl "start" blocks in kernel until stopped or count reached.
+    log_info "Starting pktgen queue_xmit on $VETH_A (threads=$PKTGEN_THREADS pkt_size=$PKTGEN_SIZE)"
+    ( pg_ctrl "start" ) &
+    FLOOD_PID=$!
+
+    # Optional: start bpftrace histograms (best-effort)
+    # if command -v bpftrace >/dev/null 2>&1; then
+    #     local bt_dir
+    #     bt_dir="$(dirname -- "$0")"
+    #
+    #     local bt_napi="${bt_dir}/napi_poll_hist.bt"
+    #     if [ -f "$bt_napi" ]; then
+    #         bpftrace "$bt_napi" > "$RESULTSDIR"/napi_poll.log 2>&1 &
+    #         BPFTRACE_PID=$!
+    #         log_info "bpftrace napi_poll histogram started (pid=$BPFTRACE_PID)"
+    #     fi
+    #
+    #     local bt_bql="${bt_dir}/veth_bql_inflight.bt"
+    #     if [ -f "$bt_bql" ]; then
+    #         bpftrace "$bt_bql" > "$RESULTSDIR"/bql_inflight.log 2>&1 &
+    #         BPFTRACE2_PID=$!
+    #         log_info "bpftrace BQL inflight histogram started (pid=$BPFTRACE2_PID)"
+    #     fi
+    # fi
+
+    # Schedule a stop after DURATION seconds
+    ( sleep "$DURATION"; pg_ctrl "stop" 2>/dev/null ) &
+    PKTGEN_TIMER_PID=$!
+}
+
+stop_traffic_pktgen() {
+    pg_ctrl "stop" 2>/dev/null || true
+    [ -n "$PKTGEN_TIMER_PID" ] && kill_process "$PKTGEN_TIMER_PID"
+    PKTGEN_TIMER_PID=""
+    [ -n "$FLOOD_PID" ] && { wait "$FLOOD_PID" 2>/dev/null || true; }
+    FLOOD_PID=""
+    pg_ctrl "reset" 2>/dev/null || true
+}
+
 start_traffic() {
     # Snapshot dmesg before test
     DMESG_BEFORE=$(dmesg | wc -l)
@@ -291,7 +420,7 @@ start_traffic() {
     fi
 
     # Optional: start bpftrace histograms (best-effort)
-    if command -v bpftrace >/dev/null 2>&1; then
+    if [ "$NO_BPFTRACE" -eq 0 ] && command -v bpftrace >/dev/null 2>&1; then
         local bt_dir
         bt_dir="$(dirname -- "$0")"
 
@@ -312,8 +441,12 @@ start_traffic() {
 }
 
 stop_traffic() {
-    [ -n "$FLOOD_PID" ] && kill_process "$FLOOD_PID"
-    FLOOD_PID=""
+    if [ "$USE_PKTGEN" -eq 1 ]; then
+        stop_traffic_pktgen
+    else
+        [ -n "$FLOOD_PID" ] && kill_process "$FLOOD_PID"
+        FLOOD_PID=""
+    fi
     [ -n "$FLOOD2_PID" ] && kill_process "$FLOOD2_PID"
     FLOOD2_PID=""
     [ -n "$SINK_PID" ] && kill_process "$SINK_PID"
@@ -540,6 +673,19 @@ collect_results() {
         done
     fi
 
+    # pktgen result summary
+    if [ "$USE_PKTGEN" -eq 1 ]; then
+        local last_thread=$((PKTGEN_THREADS - 1))
+        for ((thread = 0; thread <= last_thread; thread++)); do
+            local pgdev_file="/proc/net/pktgen/${VETH_A}@${thread}"
+            if [ -f "$pgdev_file" ]; then
+                log_info "pktgen results (thread $thread):"
+                cat "$pgdev_file"
+                cat "$pgdev_file" >> "$RESULTSDIR/pktgen.log" 2>/dev/null || true
+            fi
+        done
+    fi
+
     # Final dmesg check -- only upgrade to fail, never override existing fail
     if ! check_dmesg_bug; then
         RET=$ksft_fail
@@ -558,7 +704,11 @@ test_bql_stress() {
     setup_iptables
     log_info "kernel: $(uname -r)"
     check_bql_sysfs
-    start_traffic
+    if [ "$USE_PKTGEN" -eq 1 ]; then
+        start_traffic_pktgen
+    else
+        start_traffic
+    fi
     monitor_loop
     collect_results "veth_bql"
 }
