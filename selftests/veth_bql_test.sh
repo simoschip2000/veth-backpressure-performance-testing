@@ -353,24 +353,24 @@ start_traffic_pktgen() {
     FLOOD_PID=$!
 
     # Optional: start bpftrace histograms (best-effort)
-    # if command -v bpftrace >/dev/null 2>&1; then
-    #     local bt_dir
-    #     bt_dir="$(dirname -- "$0")"
-    #
-    #     local bt_napi="${bt_dir}/napi_poll_hist.bt"
-    #     if [ -f "$bt_napi" ]; then
-    #         bpftrace "$bt_napi" > "$RESULTSDIR"/napi_poll.log 2>&1 &
-    #         BPFTRACE_PID=$!
-    #         log_info "bpftrace napi_poll histogram started (pid=$BPFTRACE_PID)"
-    #     fi
-    #
-    #     local bt_bql="${bt_dir}/veth_bql_inflight.bt"
-    #     if [ -f "$bt_bql" ]; then
-    #         bpftrace "$bt_bql" > "$RESULTSDIR"/bql_inflight.log 2>&1 &
-    #         BPFTRACE2_PID=$!
-    #         log_info "bpftrace BQL inflight histogram started (pid=$BPFTRACE2_PID)"
-    #     fi
-    # fi
+    if [ "$NO_BPFTRACE" -eq 0 ] && command -v bpftrace >/dev/null 2>&1; then
+        local bt_dir
+        bt_dir="$(dirname -- "$0")"
+
+        local bt_napi="${bt_dir}/napi_poll_hist.bt"
+        if [ -f "$bt_napi" ]; then
+            bpftrace "$bt_napi" > "$RESULTSDIR"/napi_poll.log 2>&1 &
+            BPFTRACE_PID=$!
+            log_info "bpftrace napi_poll histogram started (pid=$BPFTRACE_PID)"
+        fi
+
+        local bt_bql="${bt_dir}/veth_bql_inflight.bt"
+        if [ -f "$bt_bql" ]; then
+            bpftrace "$bt_bql" > "$RESULTSDIR"/bql_inflight.log 2>&1 &
+            BPFTRACE2_PID=$!
+            log_info "bpftrace BQL inflight histogram started (pid=$BPFTRACE2_PID)"
+        fi
+    fi
 
     # Schedule a stop after DURATION seconds
     ( sleep "$DURATION"; pg_ctrl "stop" 2>/dev/null ) &
