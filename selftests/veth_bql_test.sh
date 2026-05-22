@@ -272,9 +272,9 @@ check_bql_sysfs() {
         log_info "BQL sysfs absent -- kernel likely missing veth BQL patchset"
         BQL_DIR=""
     fi
-    if [ -n "$TX_USECS" ]; then
-        ethtool -C "$VETH_A" tx-usecs "$TX_USECS" 2>/dev/null && \
-            log_info "ethtool tx-usecs set to $TX_USECS" || \
+    if [ -n "$TX_USECS" ] && [ -n "$BQL_DIR" ]; then
+        ip netns exec "$NS" ethtool -C "$VETH_B" tx-usecs "$TX_USECS" 2>/dev/null && \
+            log_info "ethtool tx-usecs set to $TX_USECS on $VETH_B (rx side)" || \
             log_info "ethtool tx-usecs not supported (kernel missing coalescing patch?)"
     fi
 }
