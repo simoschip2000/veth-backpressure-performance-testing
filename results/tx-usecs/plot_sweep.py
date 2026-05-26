@@ -10,7 +10,22 @@ import matplotlib.ticker as ticker
 import numpy as np
 
 
-def load(path):
+def _fmt_k(v):
+    """Format a number with K suffix: 5000 -> '5K', 7500 -> '7.5K', 500 -> '500'."""
+    v = int(v)
+    if v >= 1000:
+        k = v / 1000
+        return f"{k:g}K"
+    return str(v)
+
+
+INTERVAL_COLS = ["interval_p5_us", "interval_p25_us", "interval_p50_us",
+                  "interval_p75_us", "interval_p95_us"]
+LIMIT_COLS = ["limit_p5", "limit_p25", "limit_p50", "limit_p75", "limit_p95"]
+COUNT_COLS = ["count_p5", "count_p25", "count_p50", "count_p75", "count_p95"]
+
+
+def load(path, need_p99=False):
     # First line may be a "# cmdline..." comment
     cmdline = None
     with open(path) as f:
@@ -20,47 +35,71 @@ def load(path):
 
     df = pd.read_csv(path, comment="#", skipinitialspace=True)
     df.columns = df.columns.str.strip()
-    for col in ("tx_usecs", "nrules", "avg_pps", "avg_rtt_ms"):
+    required = ["tx_usecs", "nrules", "avg_pps", "avg_rtt_ms"]
+    if need_p99:
+        required.append("avg_p99_ms")
+    for col in required:
         if col not in df.columns:
             sys.exit(f"missing column: {col}")
     return df, cmdline
 
 
-def plot_lines(df, cmdline, outdir, label_prefix=""):
-    """Line plots: one line per nrules value, x = tx_usecs."""
+def plot_lines(df, cmdline, outdir, suffix="", use_p99=False):
+    """Line plots: one line per nrules value, x = tx_usecs (log scale)."""
+    rtt_col = "avg_p99_ms" if use_p99 else "avg_rtt_ms"
+    rtt_label = "p99 ping RTT (ms)" if use_p99 else "Avg ping RTT (ms)"
+    rtt_title = "Latency (p99) vs tx-usecs" if use_p99 else "Latency vs tx-usecs"
+
+    # Replace tx_usecs=0 with 1 for log scale; track for tick labels
+    tx_orig = sorted(df["tx_usecs"].unique())
+    df = df.copy()
+    df["tx_usecs_plot"] = df["tx_usecs"].replace(0, 1)
+
     fig, (ax_pps, ax_rtt) = plt.subplots(1, 2, figsize=(14, 5))
 
     for nrules, grp in df.groupby("nrules"):
-        grp = grp.sort_values("tx_usecs")
-        ax_pps.plot(grp["tx_usecs"], grp["avg_pps"], "o-", label=f"nrules={nrules}")
-        ax_rtt.plot(grp["tx_usecs"], grp["avg_rtt_ms"], "s-", label=f"nrules={nrules}")
+        grp = grp.sort_values("tx_usecs_plot")
+        ax_pps.plot(grp["tx_usecs_plot"], grp["avg_pps"], "o-", label=f"nrules={nrules}")
+        ax_rtt.plot(grp["tx_usecs_plot"], grp[rtt_col], "s-", label=f"nrules={nrules}")
 
-    ax_pps.set_xlabel("tx-usecs (us)")
+    # Log-scale x-axis with explicit tick labels (0 plotted at 1)
+    tx_ticks = sorted(df["tx_usecs_plot"].unique())
+    tx_labels = [_fmt_k(v) for v in tx_orig]
+    for ax in (ax_pps, ax_rtt):
+        ax.set_xscale("log")
+        ax.set_xticks(tx_ticks)
+        ax.set_xticklabels(tx_labels, rotation=45, ha="right")
+        ax.xaxis.set_minor_formatter(ticker.NullFormatter())
+        ax.set_xlabel("tx-usecs (us)")
+        ax.grid(True, alpha=0.3, which="both")
+
     ax_pps.set_ylabel("Throughput (pps)")
     ax_pps.set_title("Throughput vs tx-usecs")
+    ax_pps.set_yscale("log")
     ax_pps.legend()
-    ax_pps.grid(True, alpha=0.3)
     ax_pps.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{x/1e3:.0f}k" if x >= 1e3 else f"{x:.0f}"))
 
-    ax_rtt.set_xlabel("tx-usecs (us)")
-    ax_rtt.set_ylabel("Avg ping RTT (ms)")
-    ax_rtt.set_title("Latency vs tx-usecs")
+    ax_rtt.set_ylabel(rtt_label)
+    ax_rtt.set_title(rtt_title)
+    ax_rtt.set_yscale("log")
     ax_rtt.legend()
-    ax_rtt.grid(True, alpha=0.3)
 
     if cmdline:
         fig.suptitle(cmdline, fontsize=8, family="monospace", y=0.99)
     fig.tight_layout()
-    out = f"{outdir}/{label_prefix}sweep_lines.png"
+    out = f"{outdir}/sweep_lines{suffix}.png"
     fig.savefig(out, dpi=150)
     print(f"saved {out}")
     plt.close(fig)
 
 
-def plot_heatmaps(df, cmdline, outdir, label_prefix=""):
+def plot_heatmaps(df, cmdline, outdir, suffix="", use_p99=False):
     """Heatmaps: tx_usecs x nrules for pps and RTT."""
+    rtt_col = "avg_p99_ms" if use_p99 else "avg_rtt_ms"
+    rtt_title = "p99 ping RTT (ms)" if use_p99 else "Avg ping RTT (ms)"
+
     pps_pivot = df.pivot_table(index="nrules", columns="tx_usecs", values="avg_pps")
-    rtt_pivot = df.pivot_table(index="nrules", columns="tx_usecs", values="avg_rtt_ms")
+    rtt_pivot = df.pivot_table(index="nrules", columns="tx_usecs", values=rtt_col)
 
     # Sort so lowest nrules is at top
     pps_pivot = pps_pivot.sort_index(ascending=False)
@@ -92,7 +131,7 @@ def plot_heatmaps(df, cmdline, outdir, label_prefix=""):
     ax_rtt.set_yticklabels(rtt_pivot.index)
     ax_rtt.set_xlabel("tx-usecs (us)")
     ax_rtt.set_ylabel("nrules")
-    ax_rtt.set_title("Avg ping RTT (ms)")
+    ax_rtt.set_title(rtt_title)
     for i in range(len(rtt_pivot.index)):
         for j in range(len(rtt_pivot.columns)):
             val = rtt_pivot.values[i, j]
@@ -103,13 +142,108 @@ def plot_heatmaps(df, cmdline, outdir, label_prefix=""):
     if cmdline:
         fig.suptitle(cmdline, fontsize=8, family="monospace", y=0.99)
     fig.tight_layout()
-    out = f"{outdir}/{label_prefix}sweep_heatmap.png"
+    out = f"{outdir}/sweep_heatmap{suffix}.png"
     fig.savefig(out, dpi=150)
     print(f"saved {out}")
     plt.close(fig)
 
 
-def load_baseline(path):
+def _plot_violin(df, cols, ylabel, title, outfile, cmdline):
+    """Generic violin plot from 5 percentile columns.
+
+    Each violin is a symmetric polygon: widest at p50 (median), narrowing
+    at p25/p75, tapering to zero at p5/p95.  Grouped by nrules, x = tx_usecs.
+    """
+    has_data = all(col in df.columns for col in cols)
+    if not has_data:
+        print(f"skipping {outfile} (missing columns)")
+        return
+    mask = df[cols].sum(axis=1) > 0
+    if not mask.any():
+        print(f"skipping {outfile} (all data is zero)")
+        return
+    df = df[mask].copy()
+
+    nrules_vals = sorted(df["nrules"].unique())
+    tx_vals = sorted(df["tx_usecs"].unique())
+
+    colors = plt.cm.tab10(np.linspace(0, 1, max(len(nrules_vals), 1)))
+    n_groups = len(nrules_vals)
+    width = 0.7 / n_groups
+    half_w = width * 0.45
+
+    fig, ax = plt.subplots(figsize=(max(12, len(tx_vals) * 1.5), 6))
+
+    for gi, nrules in enumerate(nrules_vals):
+        grp = df[df["nrules"] == nrules].sort_values("tx_usecs")
+        for ti, tu in enumerate(tx_vals):
+            row = grp[grp["tx_usecs"] == tu]
+            if row.empty:
+                continue
+            r = row.iloc[0]
+            x_center = ti + (gi - n_groups / 2 + 0.5) * width
+
+            p5, p25, p50, p75, p95 = [r[c] for c in cols]
+
+            y_pts = [p5, p25, p50, p75, p95]
+            w_pts = [0, half_w * 0.6, half_w, half_w * 0.6, 0]
+
+            right_x = [x_center + w for w in w_pts]
+            left_x  = [x_center - w for w in w_pts][::-1]
+
+            ax.fill(right_x + left_x, y_pts + y_pts[::-1],
+                    color=colors[gi], alpha=0.5,
+                    edgecolor=colors[gi], linewidth=0.8)
+            ax.plot([x_center - half_w * 0.8, x_center + half_w * 0.8],
+                    [p50, p50], color="black", linewidth=1.5,
+                    solid_capstyle="round")
+
+    ax.set_xticks(range(len(tx_vals)))
+    ax.set_xticklabels(tx_vals)
+    ax.set_xlabel("tx-usecs (us)")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.set_yscale("log")
+    ax.set_axisbelow(True)
+    ax.grid(True, alpha=0.6, linestyle="--", which="both")
+
+    handles = [plt.Rectangle((0, 0), 1, 1, fc=colors[i], alpha=0.5)
+               for i in range(n_groups)]
+    ax.legend(handles, [f"nrules={n}" for n in nrules_vals], loc="upper left")
+
+    if cmdline:
+        fig.suptitle(cmdline, fontsize=8, family="monospace", y=0.99)
+    fig.tight_layout()
+    fig.savefig(outfile, dpi=150)
+    print(f"saved {outfile}")
+    plt.close(fig)
+
+
+def plot_interval_violin(df, cmdline, outdir, suffix=""):
+    _plot_violin(df, INTERVAL_COLS,
+                 ylabel="BQL completion interval (us)",
+                 title="BQL completion interval distribution (p5/p25/p50/p75/p95)",
+                 outfile=f"{outdir}/interval_violin{suffix}.png",
+                 cmdline=cmdline)
+
+
+def plot_limit_violin(df, cmdline, outdir, suffix=""):
+    _plot_violin(df, LIMIT_COLS,
+                 ylabel="BQL limit (packets)",
+                 title="BQL auto-tuned limit distribution (p5/p25/p50/p75/p95)",
+                 outfile=f"{outdir}/limit_violin{suffix}.png",
+                 cmdline=cmdline)
+
+
+def plot_count_violin(df, cmdline, outdir, suffix=""):
+    _plot_violin(df, COUNT_COLS,
+                 ylabel="Completed count (pkts per completion)",
+                 title="dql_completed batch size distribution (p5/p25/p50/p75/p95)",
+                 outfile=f"{outdir}/count_violin{suffix}.png",
+                 cmdline=cmdline)
+
+
+def load_baseline(path, need_p99=False):
     """Load a BQL-off CSV that only varies nrules (tx_usecs column ignored)."""
     cmdline = None
     with open(path) as f:
@@ -119,50 +253,76 @@ def load_baseline(path):
 
     df = pd.read_csv(path, comment="#", skipinitialspace=True)
     df.columns = df.columns.str.strip()
-    for col in ("nrules", "avg_pps", "avg_rtt_ms"):
+    required = ["nrules", "avg_pps", "avg_rtt_ms"]
+    if need_p99:
+        required.append("avg_p99_ms")
+    for col in required:
         if col not in df.columns:
             sys.exit(f"baseline missing column: {col}")
     # Average over tx_usecs if present (all values should be identical anyway)
+    agg_cols = ["avg_pps", "avg_rtt_ms"]
+    if "avg_p99_ms" in df.columns:
+        agg_cols.append("avg_p99_ms")
     if "tx_usecs" in df.columns:
-        df = df.groupby("nrules", as_index=False)[["avg_pps", "avg_rtt_ms"]].mean()
+        df = df.groupby("nrules", as_index=False)[agg_cols].mean()
     return df, cmdline
 
 
-def plot_ab(df_bql, df_nobql, outdir):
+def plot_ab(df_bql, df_nobql, outdir, use_p99=False, suffix=""):
     """A/B plot: x = nrules, lines per tx-usecs for BQL-on, one line for BQL-off."""
+    rtt_col = "avg_p99_ms" if use_p99 else "avg_rtt_ms"
+    rtt_label = "p99 ping RTT (ms)" if use_p99 else "Avg ping RTT (ms)"
+    rtt_title_suffix = "(p99)" if use_p99 else ""
+
+    # Replace nrules=0 with 1 for log scale; track for tick labels
+    nrules_orig = sorted(set(df_bql["nrules"].unique()) | set(df_nobql["nrules"].unique()))
+    df_bql = df_bql.copy()
+    df_nobql = df_nobql.copy()
+    df_bql["nrules_plot"] = df_bql["nrules"].replace(0, 1)
+    df_nobql["nrules_plot"] = df_nobql["nrules"].replace(0, 1)
+
     fig, (ax_pps, ax_rtt) = plt.subplots(1, 2, figsize=(14, 5))
 
     # BQL-on: one line per tx-usecs value
     for tu, grp in df_bql.groupby("tx_usecs"):
-        grp = grp.sort_values("nrules")
-        ax_pps.plot(grp["nrules"], grp["avg_pps"], "o-",
-                    label=f"BQL on  tx-usecs={tu}")
-        ax_rtt.plot(grp["nrules"], grp["avg_rtt_ms"], "s-",
-                    label=f"BQL on  tx-usecs={tu}")
+        grp = grp.sort_values("nrules_plot")
+        ax_pps.plot(grp["nrules_plot"], grp["avg_pps"], "o-",
+                    label=f"BQL on  tx-usecs={_fmt_k(tu)}")
+        ax_rtt.plot(grp["nrules_plot"], grp[rtt_col], "s-",
+                    label=f"BQL on  tx-usecs={_fmt_k(tu)}")
 
     # BQL-off: single line
-    bl = df_nobql.sort_values("nrules")
-    ax_pps.plot(bl["nrules"], bl["avg_pps"], "kx--", linewidth=2,
+    bl = df_nobql.sort_values("nrules_plot")
+    ax_pps.plot(bl["nrules_plot"], bl["avg_pps"], "kx--", linewidth=2,
                 markersize=8, label="BQL off")
-    ax_rtt.plot(bl["nrules"], bl["avg_rtt_ms"], "kx--", linewidth=2,
+    ax_rtt.plot(bl["nrules_plot"], bl[rtt_col], "kx--", linewidth=2,
                 markersize=8, label="BQL off")
 
-    ax_pps.set_xlabel("nrules")
+    # Log-scale x-axis with explicit tick labels (0 plotted at 1)
+    nr_ticks = sorted(set(df_bql["nrules_plot"].unique()) | set(df_nobql["nrules_plot"].unique()))
+    nr_labels = [_fmt_k(v) for v in nrules_orig]
+    for ax in (ax_pps, ax_rtt):
+        ax.set_xscale("log")
+        ax.set_xticks(nr_ticks)
+        ax.set_xticklabels(nr_labels, rotation=45, ha="right")
+        ax.xaxis.set_minor_formatter(ticker.NullFormatter())
+        ax.set_xlabel("nrules")
+        ax.grid(True, alpha=0.3, which="both")
+
     ax_pps.set_ylabel("Throughput (pps)")
     ax_pps.set_title("Throughput: BQL on (per tx-usecs) vs BQL off")
+    ax_pps.set_yscale("log")
     ax_pps.legend(fontsize=7)
-    ax_pps.grid(True, alpha=0.3)
     ax_pps.yaxis.set_major_formatter(
         ticker.FuncFormatter(lambda x, _: f"{x/1e3:.0f}k" if x >= 1e3 else f"{x:.0f}"))
 
-    ax_rtt.set_xlabel("nrules")
-    ax_rtt.set_ylabel("Avg ping RTT (ms)")
-    ax_rtt.set_title("Latency: BQL on (per tx-usecs) vs BQL off")
+    ax_rtt.set_ylabel(rtt_label)
+    ax_rtt.set_title(f"Latency {rtt_title_suffix}: BQL on (per tx-usecs) vs BQL off")
+    ax_rtt.set_yscale("log")
     ax_rtt.legend(fontsize=7)
-    ax_rtt.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    out = f"{outdir}/ab_comparison.png"
+    out = f"{outdir}/ab_comparison{suffix}.png"
     fig.savefig(out, dpi=150)
     print(f"saved {out}")
     plt.close(fig)
@@ -173,6 +333,8 @@ def main():
     parser.add_argument("csv", help="path to sweep.csv (BQL-on)")
     parser.add_argument("--compare", metavar="CSV",
                         help="BQL-off sweep CSV for A/B comparison")
+    parser.add_argument("--p99", action="store_true",
+                        help="plot p99 ping RTT instead of average")
     parser.add_argument("-o", "--outdir", default=None,
                         help="output directory (default: same as first csv)")
     args = parser.parse_args()
@@ -181,13 +343,20 @@ def main():
     outdir = args.outdir or os.path.dirname(args.csv) or "."
     os.makedirs(outdir, exist_ok=True)
 
-    df, cmdline = load(args.csv)
-    plot_lines(df, cmdline, outdir)
-    plot_heatmaps(df, cmdline, outdir)
+    # Derive suffix from CSV filename to avoid overwriting plots from different CSVs
+    csv_stem = os.path.splitext(os.path.basename(args.csv))[0]
+    suffix = f"_{csv_stem}"
+
+    df, cmdline = load(args.csv, need_p99=args.p99)
+    plot_lines(df, cmdline, outdir, suffix=suffix, use_p99=args.p99)
+    plot_heatmaps(df, cmdline, outdir, suffix=suffix, use_p99=args.p99)
+    plot_interval_violin(df, cmdline, outdir, suffix=suffix)
+    plot_limit_violin(df, cmdline, outdir, suffix=suffix)
+    plot_count_violin(df, cmdline, outdir, suffix=suffix)
 
     if args.compare:
-        df_nobql, _ = load_baseline(args.compare)
-        plot_ab(df, df_nobql, outdir)
+        df_nobql, _ = load_baseline(args.compare, need_p99=args.p99)
+        plot_ab(df, df_nobql, outdir, use_p99=args.p99, suffix=suffix)
 
 
 if __name__ == "__main__":
