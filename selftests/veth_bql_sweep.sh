@@ -77,7 +77,7 @@ echo "$CMDLINE" > "$OUTDIR/cmdline.sh"
 
 # CSV header — first line is a comment with the command line
 echo "# $CMDLINE" > "$CSV"
-echo "tx_usecs,nrules,avg_pps,avg_rtt_ms" >> "$CSV"
+echo "tx_usecs,nrules,avg_pps,avg_rtt_ms,avg_p99_ms,interval_p5_us,interval_p25_us,interval_p50_us,interval_p75_us,interval_p95_us,limit_p5,limit_p25,limit_p50,limit_p75,limit_p95,count_p5,count_p25,count_p50,count_p75,count_p95" >> "$CSV"
 
 # Count total combos for progress
 read -ra _tu_arr <<< "$TX_USECS_LIST"
@@ -86,7 +86,7 @@ TOTAL=$(( ${#_tu_arr[@]} * ${#_nr_arr[@]} ))
 CURRENT=0
 
 # Collect results into arrays for the summary table
-declare -a ALL_TX ALL_NR ALL_PPS ALL_RTT
+declare -a ALL_TX ALL_NR ALL_PPS ALL_RTT ALL_P99 ALL_IP50 ALL_LP50 ALL_CP50
 
 for tx_usecs in $TX_USECS_LIST; do
     for nrules in $NRULES_LIST; do
@@ -94,17 +94,21 @@ for tx_usecs in $TX_USECS_LIST; do
         label="tu${tx_usecs}_nr${nrules}"
         echo "--- [$CURRENT/$TOTAL] tx-usecs=$tx_usecs nrules=$nrules ---"
 
-        read -r avg_pps avg_rtt <<< "$(run_n_times "$label" \
-            --tx-usecs "$tx_usecs" --nrules "$nrules")"
+        read -r avg_pps avg_rtt avg_p99 ip5 ip25 ip50 ip75 ip95 lp5 lp25 lp50 lp75 lp95 cp5 cp25 cp50 cp75 cp95 <<< \
+            "$(run_n_times "$label" --tx-usecs "$tx_usecs" --nrules "$nrules")"
 
-        echo "$tx_usecs,$nrules,$avg_pps,$avg_rtt" >> "$CSV"
+        echo "$tx_usecs,$nrules,$avg_pps,$avg_rtt,$avg_p99,$ip5,$ip25,$ip50,$ip75,$ip95,$lp5,$lp25,$lp50,$lp75,$lp95,$cp5,$cp25,$cp50,$cp75,$cp95" >> "$CSV"
 
         ALL_TX+=("$tx_usecs")
         ALL_NR+=("$nrules")
         ALL_PPS+=("$avg_pps")
         ALL_RTT+=("$avg_rtt")
+        ALL_P99+=("$avg_p99")
+        ALL_IP50+=("$ip50")
+        ALL_LP50+=("$lp50")
+        ALL_CP50+=("$cp50")
 
-        echo "  => avg pps=$avg_pps  rtt=${avg_rtt}ms"
+        echo "  => avg pps=$avg_pps  rtt=${avg_rtt}ms  p99=${avg_p99}ms  interval_p50=${ip50}us  limit_p50=${lp50}  count_p50=${cp50}"
         echo ""
     done
 done
@@ -113,11 +117,11 @@ done
 echo "========================================"
 echo "Sweep results (average over $RUNS runs)"
 echo "========================================"
-printf "%-12s %-10s %12s %14s\n" "tx-usecs" "nrules" "pps" "rtt (ms)"
-printf "%-12s %-10s %12s %14s\n" "--------" "------" "---" "--------"
+printf "%-12s %-10s %12s %14s %14s %16s %12s %12s\n" "tx-usecs" "nrules" "pps" "rtt (ms)" "p99 (ms)" "interval p50 (us)" "limit p50" "count p50"
+printf "%-12s %-10s %12s %14s %14s %16s %12s %12s\n" "--------" "------" "---" "--------" "--------" "-----------------" "---------" "---------"
 for ((i = 0; i < ${#ALL_TX[@]}; i++)); do
-    printf "%-12s %-10s %12s %14s\n" \
-        "${ALL_TX[$i]}" "${ALL_NR[$i]}" "${ALL_PPS[$i]}" "${ALL_RTT[$i]}"
+    printf "%-12s %-10s %12s %14s %14s %16s %12s %12s\n" \
+        "${ALL_TX[$i]}" "${ALL_NR[$i]}" "${ALL_PPS[$i]}" "${ALL_RTT[$i]}" "${ALL_P99[$i]}" "${ALL_IP50[$i]}" "${ALL_LP50[$i]}" "${ALL_CP50[$i]}"
 done
 echo "========================================"
 echo ""

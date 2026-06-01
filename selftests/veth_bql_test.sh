@@ -57,12 +57,14 @@ QDISC_OPTS=""     # extra qdisc parameters (e.g. "target 1ms interval 10ms")
 BQL_DISABLE=0     # 1 to disable BQL (sets limit_min high)
 NORMAL_NAPI=0     # 1 to use normal softirq NAPI (skip threaded NAPI)
 QDISC_REPLACE=0   # 1 to test qdisc replacement under active traffic
+PING_ONLY=0       # 1 to measure baseline ping RTT (no flood traffic)
 TINY_FLOOD=0      # 1 to add 2nd UDP thread with min-size packets
 BQL_MIN_LIMIT=""   # set DQL limit_min (e.g. 8 for one cache-line of ptr_ring)
 PRINT_HIST=0      # 1 to print bpftrace histograms at end
 NO_BPFTRACE=0     # 1 to skip bpftrace histogram collection
 BURST_SPEC=""     # burst spec 'N:Mus' e.g. '100:500' = 100 pkts then 500us pause
 TX_USECS=""       # ethtool tx-usecs for BQL completion coalescing (0=per-pkt)
+GRO_NORMAL_BATCH="" # override /proc/sys/net/core/gro_normal_batch
 USE_PKTGEN=0      # 1 to use kernel pktgen instead of udp_flood
 PKTGEN_SIZE=64    # pktgen packet size (default 64 for max pps)
 PKTGEN_THREADS=1  # number of pktgen kernel threads
@@ -82,11 +84,13 @@ usage() {
     echo "  --bql-disable    disable BQL for A/B comparison"
     echo "  --normal-napi    use softirq NAPI instead of threaded NAPI"
     echo "  --qdisc-replace  test qdisc replacement under active traffic"
+    echo "  --ping           measure baseline ping RTT (no flood traffic)"
     echo "  --tiny-flood     add 2nd UDP thread with min-size packets (stress BQL bytes)"
     echo "  --bql-min-limit N set DQL limit_min to N (e.g. 8 for cache-line ptr_ring)"
     echo "  --hist           print bpftrace histograms at end"
     echo "  --no-bpftrace    skip bpftrace histogram collection"
     echo "  --tx-usecs N     set ethtool tx-usecs for BQL coalescing (0=per-pkt, default=kernel)"
+    echo "  --gro-normal-batch N  set /proc/sys/net/core/gro_normal_batch (default=kernel)"
     echo "  --burst N:Mus    bursty traffic: N pkts then M us pause (e.g. '100:500')"
     echo "  --pktgen         use kernel pktgen instead of udp_flood (kernel-space TX)"
     echo "  --pktgen-size N  pktgen packet size in bytes (default: $PKTGEN_SIZE)"
@@ -103,11 +107,13 @@ while [ $# -gt 0 ]; do
     --bql-disable) BQL_DISABLE=1; shift ;;
     --normal-napi) NORMAL_NAPI=1; shift ;;
     --qdisc-replace) QDISC_REPLACE=1; shift ;;
+    --ping)       PING_ONLY=1; shift ;;
     --tiny-flood) TINY_FLOOD=1; shift ;;
     --bql-min-limit) BQL_MIN_LIMIT="$2"; shift 2 ;;
     --hist)       PRINT_HIST=1; shift ;;
     --no-bpftrace) NO_BPFTRACE=1; shift ;;
     --tx-usecs)   TX_USECS="$2"; shift 2 ;;
+    --gro-normal-batch) GRO_NORMAL_BATCH="$2"; shift 2 ;;
     --burst)      BURST_SPEC="$2"; shift 2 ;;
     --pktgen)     USE_PKTGEN=1; shift ;;
     --pktgen-size)  PKTGEN_SIZE="$2"; shift 2 ;;
@@ -133,10 +139,12 @@ SINK_PID=""
 PING_PID=""
 BPFTRACE_PID=""
 BPFTRACE2_PID=""
+BPFTRACE3_PID=""
 PKTGEN_TIMER_PID=""
 
 # shellcheck disable=SC2329  # cleanup is invoked indirectly via trap
 cleanup() {
+    [ -n "$BPFTRACE3_PID" ] && kill_process "$BPFTRACE3_PID"
     [ -n "$BPFTRACE2_PID" ] && kill_process "$BPFTRACE2_PID"
     [ -n "$BPFTRACE_PID" ] && kill_process "$BPFTRACE_PID"
     if [ "$USE_PKTGEN" -eq 1 ]; then
@@ -153,6 +161,7 @@ cleanup() {
     cleanup_all_ns
     ip link del "$VETH_A" 2>/dev/null || true
     [ -n "$ORIG_WMEM_MAX" ] && sysctl -qw net.core.wmem_max="$ORIG_WMEM_MAX"
+    [ -n "$ORIG_GRO_NORMAL_BATCH" ] && sysctl -qw net.core.gro_normal_batch="$ORIG_GRO_NORMAL_BATCH"
     log_info "Results: $RESULTSDIR"
 }
 trap cleanup EXIT
@@ -160,8 +169,8 @@ trap cleanup EXIT
 require_command ethtool
 require_command tc
 
-# Verify pre-built binaries exist (not needed for pktgen mode)
-if [ "$USE_PKTGEN" -eq 0 ]; then
+# Verify pre-built binaries exist (not needed for pktgen or ping-only mode)
+if [ "$USE_PKTGEN" -eq 0 ] && [ "$PING_ONLY" -eq 0 ]; then
     for tool in udp_flood udp_sink; do
         if [ ! -x "$SCRIPTDIR/$tool" ]; then
             echo "ERROR: $SCRIPTDIR/$tool not found. Run 'make -C $SCRIPTDIR' first." >&2
@@ -192,6 +201,12 @@ setup_veth() {
     # which is less than the 256-entry ptr_ring and prevents backpressure.
     ORIG_WMEM_MAX=$(sysctl -n net.core.wmem_max)
     sysctl -qw net.core.wmem_max=1048576
+
+    # Always save so cleanup restores even if a previous run changed it
+    ORIG_GRO_NORMAL_BATCH=$(sysctl -n net.core.gro_normal_batch)
+    if [ -n "$GRO_NORMAL_BATCH" ]; then
+        sysctl -qw net.core.gro_normal_batch="$GRO_NORMAL_BATCH"
+    fi
 
     # Enable GRO on both ends -- activates NAPI -- BQL code path
     ethtool -K "$VETH_A" gro on 2>/dev/null || true
@@ -241,6 +256,8 @@ setup_iptables() {
     # Bulk-load iptables rules in consumer namespace to slow NAPI processing.
     # Many rules force per-packet linear rule traversal, increasing consumer
     # overhead and BQL inflight bytes -- simulates realistic k8s-like workload.
+    # Uses filter/INPUT chain; verify_iptables_hit checks at runtime
+    # whether rules are actually being evaluated.
     if [ "$NRULES" -gt 0 ]; then
         # shellcheck disable=SC2016  # single quotes intentional
         ip netns exec "$NS" bash -c '
@@ -253,8 +270,26 @@ setup_iptables() {
         )
         ' 2>/dev/null || { RET=$ksft_fail retmsg="iptables not available" \
             log_test "iptables"; exit "$EXIT_STATUS"; }
-        log_info "Loaded $NRULES iptables rules in consumer NS"
+        log_info "Loaded $NRULES iptables rules (filter/INPUT) in consumer NS"
     fi
+}
+
+verify_iptables_hit() {
+    if [ "$NRULES" -eq 0 ]; then
+        return 0
+    fi
+    local before after
+    before=$(ip netns exec "$NS" iptables -L INPUT -v -n 2>/dev/null | \
+        awk 'NR==3 {print $1}')
+    sleep 1
+    after=$(ip netns exec "$NS" iptables -L INPUT -v -n 2>/dev/null | \
+        awk 'NR==3 {print $1}')
+    if [ "$before" = "$after" ]; then
+        log_info "WARNING: iptables rules not being evaluated (pkts=$after)"
+        return 1
+    fi
+    log_info "iptables rules active (pkts: $before -> $after)"
+    return 0
 }
 
 check_bql_sysfs() {
@@ -299,6 +334,12 @@ pg_set() {
 start_traffic_pktgen() {
     # Snapshot dmesg before test
     DMESG_BEFORE=$(dmesg | wc -l)
+
+    # Snapshot peer rx_packets before traffic starts -- used to compute
+    # goodput (actually delivered packets) vs pktgen's enqueue count.
+    # Dropping qdiscs like fq_codel inflate pktgen pps because CoDel drops
+    # happen on dequeue (after pktgen counted the enqueue as "sent").
+    RX_BEFORE=$(ip netns exec "$NS" cat /sys/class/net/"$VETH_B"/statistics/rx_packets 2>/dev/null) || RX_BEFORE=0
 
     # Uses pktgen "xmit_mode queue_xmit" to inject packets into the TX
     # qdisc egress path via __dev_queue_xmit().  This exercises the full
@@ -370,6 +411,13 @@ start_traffic_pktgen() {
             BPFTRACE2_PID=$!
             log_info "bpftrace BQL inflight histogram started (pid=$BPFTRACE2_PID)"
         fi
+
+        local bt_interval="${bt_dir}/bql_interval.bt"
+        if [ -f "$bt_interval" ]; then
+            bpftrace "$bt_interval" > "$RESULTSDIR"/bql_interval.log 2>&1 &
+            BPFTRACE3_PID=$!
+            log_info "bpftrace BQL interval histogram started (pid=$BPFTRACE3_PID)"
+        fi
     fi
 
     # Schedule a stop after DURATION seconds
@@ -389,6 +437,9 @@ stop_traffic_pktgen() {
 start_traffic() {
     # Snapshot dmesg before test
     DMESG_BEFORE=$(dmesg | wc -l)
+
+    # Snapshot peer rx_packets for goodput calculation (see start_traffic_pktgen)
+    RX_BEFORE=$(ip netns exec "$NS" cat /sys/class/net/"$VETH_B"/statistics/rx_packets 2>/dev/null) || RX_BEFORE=0
 
     log_info "Starting UDP sink in namespace"
     ip netns exec "$NS" "$SCRIPTDIR"/udp_sink "$PORT" "sink[${PKT_SIZE}B]" &
@@ -437,6 +488,13 @@ start_traffic() {
             BPFTRACE2_PID=$!
             log_info "bpftrace BQL inflight histogram started (pid=$BPFTRACE2_PID)"
         fi
+
+        local bt_interval="${bt_dir}/bql_interval.bt"
+        if [ -f "$bt_interval" ]; then
+            bpftrace "$bt_interval" > "$RESULTSDIR"/bql_interval.log 2>&1 &
+            BPFTRACE3_PID=$!
+            log_info "bpftrace BQL interval histogram started (pid=$BPFTRACE3_PID)"
+        fi
     fi
 }
 
@@ -457,10 +515,12 @@ stop_traffic() {
     BPFTRACE_PID=""
     [ -n "$BPFTRACE2_PID" ] && kill_process "$BPFTRACE2_PID"
     BPFTRACE2_PID=""
+    [ -n "$BPFTRACE3_PID" ] && kill_process "$BPFTRACE3_PID"
+    BPFTRACE3_PID=""
 }
 
 check_dmesg_bug() {
-    local bug_pattern='kernel BUG|BUG:|Oops:|dql_completed'
+    local bug_pattern='kernel BUG|BUG:|Oops:|BUG_ON.*dql_completed'
     local warn_pattern='WARNING:|asks to queue packet|NETDEV WATCHDOG'
     if dmesg | tail -n +$((DMESG_BEFORE + 1)) | \
        grep -qE "$bug_pattern"; then
@@ -569,6 +629,13 @@ print_periodic_stats() {
         [ -n "$bql_line" ] && echo "  [${elapsed}s] $bql_line"
     fi
 
+    # BQL completion interval (from bpftrace, if running)
+    if [ -n "$BPFTRACE3_PID" ] && [ -f "$RESULTSDIR"/bql_interval.log ]; then
+        local bql_int_line
+        bql_int_line=$(grep '^bql_interval:' "$RESULTSDIR"/bql_interval.log | tail -1)
+        [ -n "$bql_int_line" ] && echo "  [${elapsed}s] $bql_int_line"
+    fi
+
     # Ping RTT
     PING_RTT=$(tail -1 "$RESULTSDIR"/ping.log 2>/dev/null | grep -oP 'time=\K[0-9.]+') &&
         echo "  [${elapsed}s] ping RTT=${PING_RTT}ms" || true
@@ -586,6 +653,8 @@ monitor_loop() {
         echo "$((0x${1})) $((0x${3}))" > "$RESULTSDIR/softnet_cpu${cpu}"
         cpu=$((cpu + 1))
     done < /proc/net/softnet_stat
+    # Verify iptables rules are being hit once traffic is flowing
+    verify_iptables_hit
     while kill -0 "$FLOOD_PID" 2>/dev/null; do
         sleep "$INTERVAL"
         ELAPSED=$((ELAPSED + INTERVAL))
@@ -637,8 +706,11 @@ collect_results() {
     if [ -f "$RESULTSDIR"/ping.log ]; then
         PING_LOSS=$(grep -o '[0-9.]*% packet loss' "$RESULTSDIR"/ping.log) &&
             log_info "Ping loss: $PING_LOSS"
-        PING_SUMMARY=$(tail -1 "$RESULTSDIR"/ping.log)
-        log_info "Ping summary: $PING_SUMMARY"
+        PING_STATS=$(grep -oP 'time=\K[0-9.]+' "$RESULTSDIR"/ping.log | \
+            sort -n | awk '{a[NR]=$1; sum+=$1}
+                 END {if(NR>0) {idx=int(NR*0.99); if(idx<1) idx=1;
+                      printf "n=%d avg=%.3f p99=%.3f ms\n", NR, sum/NR, a[idx]}}')
+        [ -n "$PING_STATS" ] && log_info "Ping RTT: $PING_STATS"
     fi
 
     # Watchdog summary
@@ -661,10 +733,15 @@ collect_results() {
         wait "$BPFTRACE2_PID" 2>/dev/null
         BPFTRACE2_PID=""
     fi
+    if [ -n "$BPFTRACE3_PID" ]; then
+        kill "$BPFTRACE3_PID" 2>/dev/null
+        wait "$BPFTRACE3_PID" 2>/dev/null
+        BPFTRACE3_PID=""
+    fi
 
     # Print bpftrace histograms if verbose
     if [ "$PRINT_HIST" -eq 1 ]; then
-        for logfile in "$RESULTSDIR"/napi_poll.log "$RESULTSDIR"/bql_inflight.log; do
+        for logfile in "$RESULTSDIR"/napi_poll.log "$RESULTSDIR"/bql_inflight.log "$RESULTSDIR"/bql_interval.log; do
             if [ -f "$logfile" ]; then
                 echo ""
                 echo "=== $(basename "$logfile") ==="
@@ -672,6 +749,23 @@ collect_results() {
             fi
         done
     fi
+
+    # Goodput: actual packets delivered to the peer (rx_packets delta).
+    # This is the real throughput -- pktgen's count includes packets that
+    # a dropping qdisc (fq_codel) enqueued then dropped on dequeue.
+    local rx_after
+    rx_after=$(ip netns exec "$NS" cat /sys/class/net/"$VETH_B"/statistics/rx_packets 2>/dev/null) || rx_after=0
+    local rx_delta=$((rx_after - RX_BEFORE))
+    local goodput_pps=$((rx_delta / (DURATION > 0 ? DURATION : 1)))
+    echo "$goodput_pps" > "$RESULTSDIR/goodput_pps"
+    log_info "Goodput: ${goodput_pps} pps ($rx_delta pkts in ${DURATION}s)"
+
+    # Qdisc drop count
+    local qdisc_drops
+    qdisc_drops=$(tc -j -s qdisc show dev "$VETH_A" root 2>/dev/null | \
+        jq -r '.[0].drops // 0' 2>/dev/null) || qdisc_drops=0
+    echo "$qdisc_drops" > "$RESULTSDIR/qdisc_drops"
+    log_info "Qdisc drops: $qdisc_drops"
 
     # pktgen result summary
     if [ "$USE_PKTGEN" -eq 1 ]; then
@@ -780,8 +874,52 @@ test_qdisc_replace() {
     collect_results "veth_bql_qdisc_replace"
 }
 
+# Baseline ping RTT measurement -- no flood traffic.
+# Sets up the same veth pair and iptables rules as the stress test,
+# then runs ping for DURATION seconds to measure the baseline cost
+# of packet processing through the iptables ruleset.
+test_ping() {
+    RET=$ksft_pass
+    setup_veth
+    install_qdisc "$QDISC" "$QDISC_OPTS"
+    setup_iptables
+    log_info "kernel: $(uname -r)"
+    check_bql_sysfs
+
+    DMESG_BEFORE=$(dmesg | wc -l)
+
+    log_info "Starting baseline ping to $IP_B (5/s) for ${DURATION}s"
+    ping -i 0.2 -w "$DURATION" "$IP_B" > "$RESULTSDIR"/ping.log 2>&1 &
+    PING_PID=$!
+
+    wait "$PING_PID" 2>/dev/null || true
+    PING_PID=""
+
+    # Write a zero goodput so extract_pps returns 0 (no flood traffic)
+    echo "0" > "$RESULTSDIR/goodput_pps"
+
+    if [ -f "$RESULTSDIR"/ping.log ]; then
+        PING_LOSS=$(grep -o '[0-9.]*% packet loss' "$RESULTSDIR"/ping.log) &&
+            log_info "Ping loss: $PING_LOSS"
+        PING_STATS=$(grep -oP 'time=\K[0-9.]+' "$RESULTSDIR"/ping.log | \
+            sort -n | awk '{a[NR]=$1; sum+=$1}
+                 END {if(NR>0) {idx=int(NR*0.99); if(idx<1) idx=1;
+                      printf "n=%d avg=%.3f p99=%.3f ms\n", NR, sum/NR, a[idx]}}')
+        [ -n "$PING_STATS" ] && log_info "Ping RTT: $PING_STATS"
+    fi
+
+    if ! check_dmesg_bug; then
+        RET=$ksft_fail
+        retmsg="BUG_ON triggered during ping test"
+    fi
+    log_test "veth_bql_ping"
+    exit "$EXIT_STATUS"
+}
+
 # --- Main ---
-if [ "$QDISC_REPLACE" -eq 1 ]; then
+if [ "$PING_ONLY" -eq 1 ]; then
+    test_ping
+elif [ "$QDISC_REPLACE" -eq 1 ]; then
     test_qdisc_replace
 else
     test_bql_stress

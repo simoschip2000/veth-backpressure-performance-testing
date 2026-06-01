@@ -46,8 +46,8 @@ kretprobe:veth_xmit
 
 	$inflight = (int64)($num_queued - $num_completed);
 
-	@inflight = lhist($inflight, 0, 257, 1);
-	@limit_val = lhist($limit, 0, 257, 1);
+	@inflight = lhist($inflight, 0, 1000, 1);
+	@limit_val = lhist($limit, 0, 1000, 1);
 	@inflight_stats = stats($inflight);
 	@limit_stats = stats($limit);
 	@total++;

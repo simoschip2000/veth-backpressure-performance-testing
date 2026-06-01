@@ -1,0 +1,96 @@
+#!/usr/bin/env bpftrace
+// SPDX-License-Identifier: GPL-2.0
+// Histogram of intervals between consecutive dql_completed() calls
+// and the completion batch size (count argument).
+//
+// Shows how frequently BQL completions fire, which determines how
+// often STACK_XOFF can clear and the qdisc can dequeue new packets.
+// The count histogram shows how many packets are completed per call,
+// i.e. how many were consumed since the previous completion.
+//
+// dql_completed(struct dql *dql, unsigned int count) is a non-inlined
+// function in lib/dynamic_queue_limits.c called from
+// netdev_tx_completed_queue().  In the veth BQL path this happens
+// inside veth_poll -> veth_xdp_rcv when processing consumed packets
+// from the ptr_ring.
+//
+// Device filtering: veth_poll is the NAPI callback for veth (address
+// taken, guaranteed non-inlined).  All veth dql_completed calls happen
+// inside veth_poll -> veth_xdp_rcv, so a per-tid marker around
+// veth_poll filters out completions from other BQL-enabled devices.
+//
+// Usage: bpftrace bql_interval.bt
+
+BEGIN
+{
+	@start = nsecs;
+}
+
+kprobe:veth_poll
+{
+	@in_veth[tid] = 1;
+}
+
+kretprobe:veth_poll
+{
+	delete(@in_veth[tid]);
+}
+
+kprobe:dql_completed
+/ @in_veth[tid] /
+{
+	$now = nsecs;
+	$count = arg1;
+
+	// Skip first 5 seconds to let DQL limit stabilize
+	if (($now - @start) < 5000000000) {
+		@last = $now;
+		return;
+	}
+
+	if (@last > 0) {
+		$interval_us = ($now - @last) / 1000;
+		$interval_ns = ($now - @last);
+		@interval_us = lhist($interval_us, 0, 40000, 100);
+		@interval_ns = lhist($interval_ns, 0, 1000, 100);
+		@interval_stats = stats($interval_us);
+	}
+	@last = $now;
+
+	@count = lhist($count, 0, 1000, 1);
+	@count_stats = stats($count);
+	@total++;
+}
+
+interval:s:5
+{
+	printf("bql_interval: completions=%llu\n", @total);
+	print(@interval_stats);
+	print(@count_stats);
+	clear(@interval_stats);
+	clear(@count_stats);
+	clear(@total);
+}
+
+END
+{
+	printf("\n--- dql_completed interval histogram (us, 100us buckets, 0-40ms) ---\n");
+	print(@interval_us);
+	printf("\n--- dql_completed interval histogram (ns, 100ns buckets, 0-1000ns) ---\n");
+	print(@interval_ns);
+	printf("\n--- dql_completed interval stats (us) ---\n");
+	print(@interval_stats);
+	printf("\n--- dql_completed count histogram (pkts per completion, 0-1000, step 1) ---\n");
+	print(@count);
+	printf("\n--- dql_completed count stats (pkts per completion) ---\n");
+	print(@count_stats);
+	clear(@interval_us);
+	clear(@interval_ns);
+	clear(@interval_stats);
+	clear(@count);
+	clear(@count_stats);
+	clear(@in_veth);
+	clear(@last);
+	clear(@total);
+	clear(@start);
+}

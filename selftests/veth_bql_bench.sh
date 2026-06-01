@@ -40,11 +40,11 @@ echo "Test args: ${TEST_ARGS[*]}"
 echo ""
 
 echo "--- BQL enabled ---"
-read -r bql_pps bql_rtt <<< "$(run_n_times "bql-on" )"
+read -r bql_pps bql_rtt bql_p99 _ <<< "$(run_n_times "bql-on" )"
 
 echo ""
 echo "--- BQL disabled ---"
-read -r nobql_pps nobql_rtt <<< "$(run_n_times "bql-off" --bql-disable)"
+read -r nobql_pps nobql_rtt nobql_p99 _ <<< "$(run_n_times "bql-off" --bql-disable)"
 
 echo ""
 echo "========================================"
@@ -54,6 +54,7 @@ printf "%-20s %12s %12s\n" "" "BQL on" "BQL off"
 printf "%-20s %12s %12s\n" "---" "------" "-------"
 printf "%-20s %12d %12d\n" "Throughput (pps)" "$bql_pps" "$nobql_pps"
 printf "%-20s %12s %12s\n" "Ping RTT avg (ms)" "$bql_rtt" "$nobql_rtt"
+printf "%-20s %12s %12s\n" "Ping RTT p99 (ms)" "$bql_p99" "$nobql_p99"
 
 # Differences
 if [ "$nobql_pps" -gt 0 ]; then
@@ -62,6 +63,10 @@ if [ "$nobql_pps" -gt 0 ]; then
 fi
 if [ "$(echo "$nobql_rtt > 0" | bc -l)" -eq 1 ]; then
     rtt_diff=$(awk "BEGIN {printf \"%.1f\", 100.0*($bql_rtt - $nobql_rtt)/$nobql_rtt}")
-    printf "%-20s %12s\n" "RTT diff" "${rtt_diff}%"
+    printf "%-20s %12s\n" "RTT avg diff" "${rtt_diff}%"
+fi
+if [ "$(echo "$nobql_p99 > 0" | bc -l)" -eq 1 ]; then
+    p99_diff=$(awk "BEGIN {printf \"%.1f\", 100.0*($bql_p99 - $nobql_p99)/$nobql_p99}")
+    printf "%-20s %12s\n" "RTT p99 diff" "${p99_diff}%"
 fi
 echo "========================================"
