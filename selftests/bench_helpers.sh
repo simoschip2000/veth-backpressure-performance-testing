@@ -25,16 +25,20 @@ extract_pps() {
     echo 0
 }
 
-# Extract average ping RTT (ms) from a result directory.
+# Extract average ping RTT (ms) from a result directory, or "nan" on 100% loss.
 extract_ping_rtt() {
     local resultsdir="$1"
     local ping_log="$resultsdir/ping.log"
     if [ -f "$ping_log" ]; then
         # rtt min/avg/max/mdev = 0.042/0.062/0.125/0.021 ms
-        grep -oP 'rtt [^=]+= [^/]+/\K[0-9.]+' "$ping_log" || echo 0
-        return
+        local avg
+        avg=$(grep -oP 'rtt [^=]+= [^/]+/\K[0-9.]+' "$ping_log")
+        if [ -n "$avg" ]; then
+            echo "$avg"
+            return
+        fi
     fi
-    echo 0
+    echo nan
 }
 
 # Extract p99 ping RTT (ms) from a result directory.
@@ -205,18 +209,31 @@ run_n_times() {
     local cp5_v=() cp25_v=() cp50_v=() cp75_v=() cp95_v=()
 
     for ((i = 1; i <= RUNS; i++)); do
-        echo "  [$label] run $i/$RUNS ..." >&2
+        local attempt=0 pps rtt rc
+        while true; do
+            attempt=$((attempt + 1))
+            if [[ $attempt -gt 1 ]]; then
+                echo "  [$label] run $i/$RUNS retry $((attempt - 1)) (previous ping=nan) ..." >&2
+            else
+                echo "  [$label] run $i/$RUNS ..." >&2
+            fi
 
-        local rundir
-        rundir=$(mktemp -d "/tmp/veth_bql_bench.${label}.XXXXXX")
+            local rundir
+            rundir=$(mktemp -d "/tmp/veth_bql_bench.${label}.XXXXXX")
 
-        RESULTSDIR="$rundir" "$BENCH_SCRIPTDIR/veth_bql_test.sh" \
-            "${TEST_ARGS[@]}" "${extra_args[@]}" > "$rundir/stdout.log" 2>&1
-        local rc=$?
+            RESULTSDIR="$rundir" "$BENCH_SCRIPTDIR/veth_bql_test.sh" \
+                "${TEST_ARGS[@]}" "${extra_args[@]}" > "$rundir/stdout.log" 2>&1
+            rc=$?
 
-        local pps rtt p99
-        pps=$(extract_pps "$rundir")
-        rtt=$(extract_ping_rtt "$rundir")
+            pps=$(extract_pps "$rundir")
+            rtt=$(extract_ping_rtt "$rundir")
+
+            echo "    pps=$pps  ping_avg=${rtt}ms  exit=$rc" >&2
+
+            [[ "$rtt" != "nan" ]] && break
+        done
+
+        local p99
         p99=$(extract_ping_p99 "$rundir")
         pps_values+=("$pps")
         rtt_values+=("$rtt")
