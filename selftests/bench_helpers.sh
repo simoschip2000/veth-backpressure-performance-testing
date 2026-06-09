@@ -46,7 +46,7 @@ extract_ping_p99() {
     local resultsdir="$1"
     local ping_log="$resultsdir/ping.log"
     if [ -f "$ping_log" ]; then
-        grep -oP 'time=\K[0-9.]+' "$ping_log" | sort -n | \
+        grep -oP 'time=\K[0-9.]+' "$ping_log" | LC_ALL=C sort -n | \
             awk '{a[NR]=$1} END {if(NR>0) {idx=int(NR*0.99); if(idx<1) idx=1; print a[idx]} else print 0}'
         return
     fi
